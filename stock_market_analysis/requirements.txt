@@ -8,6 +8,7 @@ python-dotenv>=1.0.1
 # Database & Migrations
 sqlalchemy>=2.0.28
 psycopg[binary]>=3.1.18
+psycopg2-binary>=2.9.9
 alembic>=1.13.1
 
 # Quantitative Analysis & Machine Learning

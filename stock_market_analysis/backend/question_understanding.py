@@ -250,3 +250,7 @@ def parse_user_question(query: str) -> Dict[str, Any]:
         "depth": "deep" if is_deep else "standard",
         "language": "en"
     }
+
+
+# Function alias for backwards compatibility and API imports
+understand_user_question = parse_user_question

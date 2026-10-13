@@ -114,12 +114,13 @@ chmod +x start_app.sh
    - Runtime: `Python 3`.
    - Build Command:
      ```bash
-     pip install -r requirements.txt && cd backend && alembic upgrade head && python3 seed.py
+     pip install -r requirements.txt
      ```
    - Start Command:
      ```bash
-     cd backend && uvicorn api:app --host 0.0.0.0 --port $PORT
+     ./start_render.sh
      ```
+     *(Or: `python3 -m uvicorn backend.api:app --host 0.0.0.0 --port $PORT`)*
    - Add Environment Variable:
      - Key: `DATABASE_URL`
      - Value: Paste the **Internal Database URL** from your Render PostgreSQL instance.

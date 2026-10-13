@@ -140,6 +140,8 @@ interface AnalysisData {
   };
 }
 
+const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'intro' | 'dashboard'>('intro');
 
@@ -167,7 +169,7 @@ export default function App() {
     setError(null);
     setShowDropdown(false);
     try {
-      const response = await fetch(`http://localhost:8000/api/analyze?symbol=${encodeURIComponent(symbolToFetch)}&period=${encodeURIComponent(periodToFetch)}`);
+      const response = await fetch(`${API_BASE_URL}/api/analyze?symbol=${encodeURIComponent(symbolToFetch)}&period=${encodeURIComponent(periodToFetch)}`);
       const result = await response.json();
       if (!response.ok) {
         throw new Error(result.detail || `Failed to load analysis for ${symbolToFetch}`);
@@ -182,7 +184,7 @@ export default function App() {
       console.warn("Primary fetch failed, loading default fallback:", err.message);
       if (symbolToFetch !== "TMPV.NS") {
         try {
-          const fallbackResp = await fetch(`http://localhost:8000/api/analyze?symbol=TMPV.NS&period=${encodeURIComponent(periodToFetch)}`);
+          const fallbackResp = await fetch(`${API_BASE_URL}/api/analyze?symbol=TMPV.NS&period=${encodeURIComponent(periodToFetch)}`);
           if (fallbackResp.ok) {
             const fallbackResult = await fallbackResp.json();
             setData(fallbackResult);
@@ -215,7 +217,7 @@ export default function App() {
     setSearchInput(val);
     if (val.trim().length >= 2) {
       try {
-        const res = await fetch(`http://localhost:8000/api/search?q=${encodeURIComponent(val)}`);
+        const res = await fetch(`${API_BASE_URL}/api/search?q=${encodeURIComponent(val)}`);
         if (res.ok) {
           const items = await res.json();
           setSearchResults(items);
@@ -253,12 +255,12 @@ export default function App() {
 
   const handleDownloadPDFDirect = () => {
     const sym = data?.symbol || ticker;
-    window.open(`http://localhost:8000/api/export/pdf?symbol=${encodeURIComponent(sym)}&period=${encodeURIComponent(selectedPeriod)}&split_pages=${splitPages}&inline=false`, '_blank');
+    window.open(`${API_BASE_URL}/api/export/pdf?symbol=${encodeURIComponent(sym)}&period=${encodeURIComponent(selectedPeriod)}&split_pages=${splitPages}&inline=false`, '_blank');
   };
 
   const handleDownloadExcelDirect = () => {
     const sym = data?.symbol || ticker;
-    window.open(`http://localhost:8000/api/export/excel?symbol=${encodeURIComponent(sym)}&period=${encodeURIComponent(selectedPeriod)}&split_sheets=${splitSheets}`, '_blank');
+    window.open(`${API_BASE_URL}/api/export/excel?symbol=${encodeURIComponent(sym)}&period=${encodeURIComponent(selectedPeriod)}&split_sheets=${splitSheets}`, '_blank');
   };
 
   // Planned Trade Scenario Simulator Metrics
@@ -1429,7 +1431,7 @@ export default function App() {
             {/* Embedded PDF Viewer Iframe */}
             <div className="flex-1 bg-slate-100">
               <iframe
-                src={`http://localhost:8000/api/export/pdf?symbol=${encodeURIComponent(data?.symbol || ticker)}&split_pages=true&inline=true`}
+                src={`${API_BASE_URL}/api/export/pdf?symbol=${encodeURIComponent(data?.symbol || ticker)}&split_pages=true&inline=true`}
                 className="w-full h-full border-0"
                 title="PDF Report Live Preview"
               />

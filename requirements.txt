@@ -1,0 +1,24 @@
+# QuantNova AI — Production Dependencies
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.4
+pydantic-settings>=2.2.1
+python-dotenv>=1.0.1
+
+# Database & Migrations
+sqlalchemy>=2.0.28
+psycopg[binary]>=3.1.18
+psycopg2-binary>=2.9.9
+alembic>=1.13.1
+
+# Quantitative Analysis & Machine Learning
+pandas>=2.2.0
+numpy>=1.26.0
+yfinance>=0.2.36
+scikit-learn>=1.4.0
+
+# Reports & Visualizations
+openpyxl>=3.1.2
+reportlab>=4.1.0
+plotly>=5.19.0
+requests>=2.31.0

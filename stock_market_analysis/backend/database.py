@@ -50,9 +50,25 @@ if SQLALCHEMY_AVAILABLE:
             expire_on_commit=False,
         )
     except Exception as exc:
-        logger.warning("Failed to initialize SQLAlchemy engine: %s", exc)
-        engine = None
-        SessionLocal = None
+        # If postgresql+psycopg driver fails, attempt fallback to postgresql+psycopg2
+        if "postgresql+psycopg://" in db_url:
+            alt_url = db_url.replace("postgresql+psycopg://", "postgresql+psycopg2://")
+            try:
+                engine = create_engine(alt_url, **engine_kwargs)
+                SessionLocal = sessionmaker(
+                    autocommit=False,
+                    autoflush=False,
+                    bind=engine,
+                    expire_on_commit=False,
+                )
+            except Exception:
+                logger.warning("Failed to initialize SQLAlchemy engine: %s", exc)
+                engine = None
+                SessionLocal = None
+        else:
+            logger.warning("Failed to initialize SQLAlchemy engine: %s", exc)
+            engine = None
+            SessionLocal = None
 
 
 def get_db() -> Generator[Optional[Any], None, None]:
