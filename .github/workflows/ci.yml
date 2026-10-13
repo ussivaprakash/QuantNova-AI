@@ -1,0 +1,64 @@
+name: QuantNova CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend-checks:
+    name: Backend Lint, Syntax & Smoke Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r stock_market_analysis/requirements.txt
+
+      - name: Python syntax check (compileall)
+        run: |
+          python -m compileall stock_market_analysis/backend
+
+      - name: Verify Uvicorn ASGI Entrypoint
+        run: |
+          cd stock_market_analysis && python -m uvicorn backend.api:app --help
+
+      - name: Run Backend Smoke & Health Tests
+        run: |
+          python -m unittest discover -s tests -v
+
+  frontend-checks:
+    name: Frontend Build & Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: 'stock_market_analysis/frontend/package-lock.json'
+
+      - name: Install Frontend Dependencies
+        working-directory: stock_market_analysis/frontend
+        run: npm ci
+
+      - name: Run Frontend Linter
+        working-directory: stock_market_analysis/frontend
+        run: npm run lint
+
+      - name: Run Frontend Production Build
+        working-directory: stock_market_analysis/frontend
+        run: npm run build
