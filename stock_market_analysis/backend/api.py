@@ -14,19 +14,32 @@ import os
 import json
 import urllib.request
 import urllib.parse
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import sys
+from contextlib import asynccontextmanager
 import pandas as pd
 import numpy as np
 
-from fastapi import FastAPI, Query, HTTPException, Response
+from fastapi import FastAPI, Query, HTTPException, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from sqlalchemy.orm import Session
 
 # Add current directory to python path
 CODE_DIR = Path(__file__).resolve().parent
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
+
+from database import get_db, check_database_connection
+from repositories import (
+    StockRepository,
+    MarketDataRepository,
+    FundamentalsRepository,
+    AnalysisRepository,
+    AIResearchRepository,
+)
+from question_understanding import understand_user_question
+from research_planner import build_research_plan
 
 from data_loader import PipelineConfig, download_raw_data
 from data_cleaner import audit_ohlcv_dataset
@@ -41,10 +54,25 @@ from risk_analysis import analyze_risk_metrics
 from dashboard import generate_html_dashboard, export_to_excel_workbook
 from pdf_exporter import generate_pdf_report
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Check database connection
+    db_ok = check_database_connection()
+    if db_ok:
+        print("✓ [PostgreSQL] Connected to QuantNova AI Database successfully.")
+    else:
+        print("⚠️ [PostgreSQL] Database not reachable. Running in resilient hybrid mode.")
+    yield
+    # Shutdown
+    print("--> QuantNova AI Backend shutting down.")
+
+
 app = FastAPI(
     title="QuantNova AI - Quantitative Stock Intelligence API",
-    description="Institutional 13-Stage Quantitative Analysis & AI Intelligence Platform API",
-    version="2.0.0"
+    description="Institutional 13-Stage Quantitative Analysis & AI Intelligence Platform API with PostgreSQL persistence",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 # Enable CORS for Next.js / Vite React frontend
@@ -159,37 +187,93 @@ def resolve_symbol(raw_input: str) -> str:
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "online", "engine": "Quantitative Signal Engine v2.0", "active_stages": 13}
+    db_connected = check_database_connection()
+    return {
+        "status": "online",
+        "engine": "Quantitative Signal Engine v2.0",
+        "database": "connected" if db_connected else "fallback_mode",
+        "active_stages": 13,
+    }
+
+
+@app.get("/api/stocks")
+def list_stocks(
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db)
+):
+    """Retrieves all active stocks from PostgreSQL catalog."""
+    try:
+        stocks = StockRepository.get_all_active(db, limit=limit)
+        if stocks:
+            return [
+                {
+                    "id": s.id,
+                    "symbol": s.symbol,
+                    "name": s.company_name,
+                    "exchange": s.exchange,
+                    "sector": s.sector,
+                    "industry": s.industry,
+                }
+                for s in stocks
+            ]
+    except Exception:
+        pass
+    return STOCK_DATABASE
 
 
 @app.get("/api/search")
-def search_stocks(q: str = Query("", description="Search ticker symbol or company name")):
+def search_stocks(
+    q: str = Query("", description="Search ticker symbol or company name"),
+    db: Session = Depends(get_db),
+):
     query = q.strip()
     if not query:
+        try:
+            db_stocks = StockRepository.get_all_active(db, limit=30)
+            if db_stocks:
+                return [{"symbol": s.symbol, "name": s.company_name, "exchange": s.exchange} for s in db_stocks]
+        except Exception:
+            pass
         return STOCK_DATABASE
 
     query_upper = query.upper()
     matches = []
-    # Local DB match
-    for item in STOCK_DATABASE:
-        if query_upper in item["symbol"].upper() or query_upper in item["name"].upper():
-            matches.append(item)
 
-    # Live Yahoo Search
+    # 1. Search PostgreSQL database first
     try:
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(query)}&quotesCount=8&newsCount=0"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            search_res = json.loads(resp.read().decode())
-            quotes = search_res.get("quotes", [])
-            for q_item in quotes:
-                sym = q_item.get("symbol", "")
-                name = q_item.get("longname") or q_item.get("shortname") or sym
-                exch = q_item.get("exchDisp", "NSE/BSE")
-                if sym and not any(m["symbol"] == sym for m in matches):
-                    matches.append({"symbol": sym, "name": name, "exchange": exch})
+        db_results = StockRepository.search(db, query, limit=10)
+        for s in db_results:
+            matches.append({"symbol": s.symbol, "name": s.company_name, "exchange": s.exchange})
     except Exception:
         pass
+
+    # 2. Local fallback list
+    if not matches:
+        for item in STOCK_DATABASE:
+            if query_upper in item["symbol"].upper() or query_upper in item["name"].upper():
+                matches.append(item)
+
+    # 3. Live Yahoo Search if not found
+    if not matches:
+        try:
+            url = f"https://query2.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(query)}&quotesCount=8&newsCount=0"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                search_res = json.loads(resp.read().decode())
+                quotes = search_res.get("quotes", [])
+                for q_item in quotes:
+                    sym = q_item.get("symbol", "")
+                    name = q_item.get("longname") or q_item.get("shortname") or sym
+                    exch = q_item.get("exchDisp", "NSE/BSE")
+                    if sym and not any(m["symbol"] == sym for m in matches):
+                        matches.append({"symbol": sym, "name": name, "exchange": exch})
+                        # Cache into PostgreSQL
+                        try:
+                            StockRepository.upsert(db, {"symbol": sym, "company_name": name, "exchange": exch})
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     return matches if matches else [{"symbol": f"{query_upper}.NS", "name": f"Search Ticker: {query_upper}", "exchange": "NSE/BSE"}]
 
@@ -203,7 +287,8 @@ CACHE_TTL_SECONDS = 300  # 5 minutes cache
 @app.get("/api/analyze")
 def analyze_stock(
     symbol: str = Query("TATAMOTORS.NS", description="Stock Ticker Symbol"),
-    period: str = Query("1y", description="Timeframe: 1m, 3m, 6m, 1y, 5y, max")
+    period: str = Query("1y", description="Timeframe: 1m, 3m, 6m, 1y, 5y, max"),
+    db: Session = Depends(get_db),
 ):
     ticker_clean = resolve_symbol(symbol)
     cache_key = f"{ticker_clean}_{period.lower()}"
@@ -218,8 +303,8 @@ def analyze_stock(
     try:
         config = PipelineConfig(ticker=ticker_clean, period=period)
 
-        # Stage 1: Data Collection
-        raw_df = download_raw_data(config)
+        # Stage 1: Data Collection (PostgreSQL Cache first, Yahoo fallback)
+        raw_df = download_raw_data(config, db=db)
 
         # Stage 2: Data Cleaning
         cleaned_df, audit_summary, audit_report_df = audit_ohlcv_dataset(raw_df)
@@ -230,8 +315,8 @@ def analyze_stock(
         # Stage 4: Trend Analysis
         df_trend = analyze_trend_regime(df_indicators)
 
-        # Stage 5: Fundamental Analysis
-        fund_data = analyze_fundamentals(ticker_clean)
+        # Stage 5: Fundamental Analysis (PostgreSQL Cache first, Yahoo fallback)
+        fund_data = analyze_fundamentals(ticker_clean, db=db)
 
         # Stage 6: Market Context Analysis
         market_ctx = analyze_market_context(df_trend)
@@ -363,6 +448,56 @@ def analyze_stock(
             "chart_series": chart_series,
         }
 
+        # Persist Analysis Snapshot, Trading Signal, and Risk Assessment to PostgreSQL
+        try:
+            stock = StockRepository.upsert(db, {
+                "symbol": ticker_clean,
+                "company_name": fund_data.get("Company Name", ticker_clean),
+                "exchange": "BSE" if ticker_clean.endswith(".BO") else "NSE",
+                "sector": fund_data.get("Sector"),
+                "industry": fund_data.get("Industry"),
+            })
+
+            snapshot = AnalysisRepository.create_snapshot(db, stock.id, {
+                "period": period,
+                "latest_price": close_price,
+                "trend_classification": str(latest_row.get("Trend Classification", "Sideways")),
+                "trend_score": int(latest_row.get("Trend Score", 0)),
+                "ma20_slope": float(latest_row.get("MA20 Slope (%)", 0)),
+                "ml_bullish_prob_pct": float(latest_row.get("ML Bull Prob (%)", 50.0)),
+                "ml_prediction": str(latest_row.get("ML Prediction", "Neutral")),
+                "ml_confidence": str(latest_row.get("ML Confidence", "Low")),
+                "ml_metrics": rf_metrics,
+                "feature_importances": feature_importance_df.to_dict(orient="records") if not feature_importance_df.empty else [],
+                "indicator_summary": response_payload["stage_3_indicators"],
+                "backtest_summary": backtest_metrics_df.to_dict(orient="records") if not backtest_metrics_df.empty else [],
+            })
+
+            f_score = fund_data.get("Fundamental Score")
+            AnalysisRepository.save_trading_signal(db, stock.id, {
+                "signal": str(latest_row.get("Signal", "HOLD / WAIT")),
+                "confidence_score": int(latest_row.get("Signal Confidence (%)", 40)),
+                "technical_score": int(latest_row.get("Technical Score", 65)),
+                "fundamental_score": int(f_score) if isinstance(f_score, (int, float)) else None,
+                "risk_score": int(risk_data.get("Risk Score", 35)),
+                "risk_level": str(risk_data.get("Risk Category", "Moderate Risk")),
+                "entry_price": close_price,
+                "stop_loss": stop_loss,
+                "target_price": target_price,
+                "risk_reward_ratio": str(risk_data.get("Risk-to-Reward Ratio", "1:1.67")),
+                "expected_time_horizon": "1 - 3 Months Swing / Position",
+                "pros": response_payload["stage_10_decision_engine"]["pros"],
+                "cons": response_payload["stage_10_decision_engine"]["cons"],
+                "risks": response_payload["stage_10_decision_engine"]["risks"],
+                "reason_for_decision": str(latest_row.get("Reason for Decision", "")),
+                "ai_explanation": response_payload["stage_10_decision_engine"]["ai_explanation"],
+            }, analysis_id=snapshot.id)
+
+            AnalysisRepository.save_risk_assessment(db, stock.id, risk_data, analysis_id=snapshot.id)
+            FundamentalsRepository.upsert(db, stock.id, fund_data)
+        except Exception as db_err:
+            print(f"      ⚠️ Failed to persist analysis results to DB: {db_err}")
+
         sanitized_payload = sanitize_json(response_payload)
         ANALYSIS_CACHE[cache_key] = (now, sanitized_payload)
         return JSONResponse(content=sanitized_payload)
@@ -460,26 +595,86 @@ def export_excel(
         raise HTTPException(status_code=400, detail=f"Excel Export failed for {ticker_clean}: {str(e)}")
 
 
+@app.get("/api/signals/latest")
+def get_latest_signals(
+    limit: int = Query(20, ge=1, le=100),
+    type: Optional[str] = Query(None, description="Filter by signal type: BUY, SELL, HOLD"),
+    db: Session = Depends(get_db),
+):
+    """Returns the latest generated quantitative trading signals across all tracked equities."""
+    try:
+        signals = AnalysisRepository.get_latest_signals(db, limit=limit, signal_type=type)
+        return [
+            {
+                "id": s.id,
+                "stock_symbol": s.stock.symbol if s.stock else None,
+                "company_name": s.stock.company_name if s.stock else None,
+                "signal_date": s.signal_date.strftime("%Y-%m-%d"),
+                "signal_type": s.signal_type,
+                "confidence_score": s.confidence_score,
+                "technical_score": s.technical_score,
+                "fundamental_score": s.fundamental_score,
+                "risk_score": s.risk_score,
+                "risk_level": s.risk_level,
+                "entry_price": float(s.entry_price),
+                "stop_loss": float(s.stop_loss),
+                "target_price": float(s.target_price),
+                "risk_reward_ratio": s.risk_reward_ratio,
+                "reason": s.reason_for_decision,
+            }
+            for s in signals
+        ]
+    except Exception:
+        return []
+
+
+@app.get("/api/research/history")
+def get_research_history(
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Returns recent AI chat and financial research logs."""
+    try:
+        logs = AIResearchRepository.get_recent_logs(db, limit=limit)
+        return [
+            {
+                "id": log.id,
+                "symbol": log.interpreted_symbol,
+                "query": log.raw_query,
+                "intent": log.interpreted_intent,
+                "agent_type": log.agent_type,
+                "response": log.ai_response,
+                "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S") if log.created_at else None,
+            }
+            for log in logs
+        ]
+    except Exception:
+        return []
+
+
 @app.get("/api/chat")
 def chatbot_query(
     prompt: str = Query(..., description="User prompt or question for GenAI chatbot"),
-    symbol: str = Query("TATAMOTORS.NS", description="Stock Ticker Symbol")
+    symbol: str = Query("TATAMOTORS.NS", description="Stock Ticker Symbol"),
+    db: Session = Depends(get_db),
 ):
     """
     GenAI Institutional Stock Intelligence Chatbot Endpoint.
     Supports multi-agent orchestration, Tata Motors AN2 share capital details, and live stock analytics.
+    Persists interaction history and research plans to PostgreSQL.
     """
     ticker_clean = resolve_symbol(symbol)
     prompt_lower = prompt.lower()
+    response_payload = {}
 
     # 1. AN2 / Share Capital / Tata Motors Share Count Queries
     if any(k in prompt_lower for k in ["an2", "share capital", "shares", "how many shares", "shareholding", "demerger"]):
         try:
-            fund_data = analyze_fundamentals(ticker_clean)
+            fund_data = analyze_fundamentals(ticker_clean, db=db)
         except Exception:
             fund_data = {}
 
-        return {
+        response_payload = {
             "query": prompt,
             "symbol": ticker_clean,
             "agent_type": "ShareCapital_AN2_Agent",
@@ -499,7 +694,7 @@ def chatbot_query(
 
     # 2. Chatbot using a Chatbot / Multi-Agent System Queries
     elif any(k in prompt_lower for k in ["chatbot use a chatbot", "can a chatbot use", "multi-agent", "agent"]):
-        return {
+        response_payload = {
             "query": prompt,
             "symbol": ticker_clean,
             "agent_type": "Orchestrator_Agent",
@@ -517,11 +712,11 @@ def chatbot_query(
     # 3. Default Quantitative & Live Stock Query
     else:
         try:
-            fund_data = analyze_fundamentals(ticker_clean)
+            fund_data = analyze_fundamentals(ticker_clean, db=db)
         except Exception:
             fund_data = {}
 
-        return {
+        response_payload = {
             "query": prompt,
             "symbol": ticker_clean,
             "agent_type": "QuantIntelligence_Agent",
@@ -535,6 +730,30 @@ def chatbot_query(
             ),
             "data": fund_data
         }
+
+    # Persist interaction and research plan to PostgreSQL
+    try:
+        stock = StockRepository.get_by_symbol(db, ticker_clean)
+        stock_id = stock.id if stock else None
+        parsed_q = understand_user_question(prompt)
+        plan = build_research_plan(parsed_q)
+        AIResearchRepository.log_query(
+            db=db,
+            raw_query=prompt,
+            symbol=ticker_clean,
+            intent=parsed_q.get("intent"),
+            timeframe=parsed_q.get("timeframe"),
+            peers=parsed_q.get("comparison_peers"),
+            research_plan=plan,
+            agent_type=response_payload.get("agent_type"),
+            ai_response=response_payload.get("reply", ""),
+            context_data=response_payload.get("data", {}),
+            stock_id=stock_id,
+        )
+    except Exception as e:
+        print(f"      ⚠️ Failed to log AI chat interaction: {e}")
+
+    return response_payload
 
 
 def ticker_symbol_name(symbol: str) -> str:

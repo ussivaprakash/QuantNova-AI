@@ -1,0 +1,14 @@
+{
+  "name": "quantnova-ai",
+  "version": "1.0.0",
+  "description": "QuantNova AI - Quantitative Stock Research & Intelligence Platform",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix stock_market_analysis/frontend run dev",
+    "start": "npm --prefix stock_market_analysis/frontend run dev",
+    "build": "npm --prefix stock_market_analysis/frontend run build",
+    "preview": "npm --prefix stock_market_analysis/frontend run preview",
+    "lint": "npm --prefix stock_market_analysis/frontend run lint",
+    "install:frontend": "npm --prefix stock_market_analysis/frontend install"
+  }
+}

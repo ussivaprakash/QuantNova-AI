@@ -75,22 +75,41 @@ TICKER_ALIASES = {
 }
 
 
-def download_raw_data(config: PipelineConfig) -> pd.DataFrame:
+def download_raw_data(config: PipelineConfig, db=None) -> pd.DataFrame:
     """
-    Download raw daily OHLCV stock data from Yahoo Finance.
+    Download raw daily OHLCV stock data from PostgreSQL database if cached,
+    otherwise download from Yahoo Finance and persist to database.
     Includes robust fallback periods and synthetic data generator if requested range fails.
     """
-    # Sanitize ticker symbol
     raw_ticker = config.ticker.strip().upper()
     if " " in raw_ticker:
         raw_ticker = raw_ticker.replace(" ", "")
 
+    period_req = config.period.lower() if config.period else "1y"
+    num_days_target = PERIOD_DAYS_MAP.get(period_req, 2520)
+
+    # 1. Try reading from PostgreSQL Database first if db session is provided
+    if db is not None:
+        try:
+            from repositories.stock_repo import StockRepository
+            from repositories.market_data_repo import MarketDataRepository
+
+            stock = StockRepository.get_by_symbol(db, raw_ticker)
+            if stock:
+                cached_bars = MarketDataRepository.get_bars_by_stock_id(db, stock.id)
+                if len(cached_bars) >= min(num_days_target, 20):
+                    df_db = MarketDataRepository.to_dataframe(cached_bars)
+                    if len(df_db) > num_days_target:
+                        df_db = df_db.tail(num_days_target).reset_index(drop=True)
+                    print(f"      ✓ Retrieved {len(df_db)} OHLCV bars from PostgreSQL cache for {raw_ticker}")
+                    return df_db
+        except Exception as e:
+            print(f"      ⚠️ Database cache check failed ({e}), proceeding with external download...")
+
+    # 2. External Download via Yahoo Finance
     tickers_to_try = [raw_ticker]
     if raw_ticker in TICKER_ALIASES:
         tickers_to_try.extend(TICKER_ALIASES[raw_ticker])
-
-    period_req = config.period.lower() if config.period else "1y"
-    num_days_target = PERIOD_DAYS_MAP.get(period_req, 2520)
 
     periods_to_try = [period_req, "max", "5y", "1y", "6m"]
     data = pd.DataFrame()
@@ -139,5 +158,34 @@ def download_raw_data(config: PipelineConfig) -> pd.DataFrame:
     result_df = data[expected_columns].sort_values("Date").reset_index(drop=True)
     if len(result_df) > num_days_target:
         result_df = result_df.tail(num_days_target).reset_index(drop=True)
+
+    # 3. Cache newly downloaded market data in PostgreSQL if db session is provided
+    if db is not None:
+        try:
+            from repositories.stock_repo import StockRepository
+            from repositories.market_data_repo import MarketDataRepository
+
+            stock = StockRepository.upsert(db, {
+                "symbol": raw_ticker,
+                "company_name": raw_ticker,
+                "exchange": "BSE" if raw_ticker.endswith(".BO") else "NSE",
+            })
+            bars_to_upsert = [
+                {
+                    "trading_date": row["Date"].date(),
+                    "open": float(row["Open"]),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                    "adj_close": float(row.get("Adj Close", row["Close"])),
+                    "volume": int(row["Volume"]),
+                }
+                for _, row in result_df.iterrows()
+            ]
+            MarketDataRepository.bulk_upsert(db, stock.id, bars_to_upsert)
+            print(f"      ✓ Persisted {len(bars_to_upsert)} bars to PostgreSQL for {raw_ticker}")
+        except Exception as e:
+            print(f"      ⚠️ Failed to cache market data in DB: {e}")
+
     return result_df
 

@@ -25,10 +25,24 @@ import pandas as pd
 import numpy as np
 
 
-def analyze_fundamentals(ticker_symbol: str) -> Dict[str, Any]:
+def analyze_fundamentals(ticker_symbol: str, db=None) -> Dict[str, Any]:
     """
     Extracts fundamental financial metrics and evaluates fundamental strength.
+    Uses cached PostgreSQL fundamentals if recently saved.
     """
+    if db is not None:
+        try:
+            from repositories.stock_repo import StockRepository
+            from repositories.fundamentals_repo import FundamentalsRepository
+
+            stock = StockRepository.get_by_symbol(db, ticker_symbol)
+            if stock:
+                cached = FundamentalsRepository.get_latest(db, stock.id)
+                if cached and cached.raw_metrics:
+                    return cached.raw_metrics
+        except Exception:
+            pass
+
     try:
         ticker = yf.Ticker(ticker_symbol)
         info = ticker.info or {}

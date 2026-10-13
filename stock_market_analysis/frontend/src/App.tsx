@@ -18,9 +18,6 @@ import {
   Calculator,
   X,
   Sparkles,
-  Cpu,
-  BookOpen,
-  ArrowRight,
   Globe,
 } from 'lucide-react';
 
@@ -142,17 +139,6 @@ interface AnalysisData {
     signals: string[];
   };
 }
-
-const PRESET_TICKERS = [
-  { symbol: "TATAMOTORS.NS", name: "Tata Motors" },
-  { symbol: "ASHOKLEY.NS", name: "Ashok Leyland" },
-  { symbol: "IOB.NS", name: "Indian Overseas Bank" },
-  { symbol: "RELIANCE.NS", name: "Reliance Ind" },
-  { symbol: "TCS.NS", name: "TCS" },
-  { symbol: "INFY.NS", name: "Infosys" },
-  { symbol: "SBIN.NS", name: "State Bank" },
-  { symbol: "ICICIBANK.NS", name: "ICICI Bank" },
-];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'intro' | 'dashboard'>('intro');
@@ -494,6 +480,18 @@ export default function App() {
         </div>
 
       </header>
+
+      {error && (
+        <div className="max-w-7xl mx-auto px-6 mt-4">
+          <div className="bg-rose-50 border border-rose-200 text-rose-700 px-4 py-3 rounded-xl flex items-center justify-between text-xs shadow-sm">
+            <div className="flex items-center space-x-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>{error}</span>
+            </div>
+            <button onClick={() => setError(null)} className="text-rose-500 hover:text-rose-700 font-bold ml-4">✕</button>
+          </div>
+        </div>
+      )}
 
 
       {/* ========================================================================= */}
