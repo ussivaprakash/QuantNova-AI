@@ -30,6 +30,7 @@ CODE_DIR = Path(__file__).resolve().parent
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
+from config import settings
 from database import get_db, check_database_connection
 from repositories import (
     StockRepository,
@@ -75,10 +76,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Enable CORS for Next.js / Vite React frontend
+# Enable CORS for Vite React / Vercel frontend
+allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+]
+if hasattr(settings, "cors_origin_list"):
+    for o in settings.cors_origin_list:
+        if o not in allowed_origins and "*" not in o:
+            allowed_origins.append(o)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
