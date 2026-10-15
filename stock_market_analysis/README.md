@@ -124,10 +124,10 @@ chmod +x start_app.sh
 1. In Vercel, import your GitHub repository.
 2. Set Root Directory to `stock_market_analysis/frontend`.
 3. Set Framework Preset to `Vite`.
-4. Add Environment Variable:
-   - `VITE_API_BASE_URL=https://<actual-render-service>.onrender.com` (copy the hostname from the Render service dashboard; do not append `/api`).
+4. Set the Production environment variable:
+   - `VITE_API_BASE_URL=https://quantnova-ai.onrender.com` (do not append `/api`). The same public origin is also in `frontend/.env.production` so the frontend has a correct build-time default; the Vercel value overrides it when supplied.
    - Optionally set `VITE_API_TIMEOUT_MS=180000`.
-5. Redeploy after changing either Vite variable because Vite embeds them in the build.
+5. Redeploy after changing either Vite variable because Vite embeds them in the build. The production build checks that the Render origin is present and localhost is absent.
 
 ---
 
