@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node scripts/verify-production-api.mjs",
+    "build": "tsc -b && vite build && node --test scripts/*.test.mjs && node scripts/verify-production-api.mjs",
     "lint": "oxlint",
+    "test:api-config": "node --test scripts/*.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -1,4 +1,5 @@
 import React, { useState, useRef } from 'react';
+import { buildApiUrl, resolveApiBaseUrl } from './api-config.mjs';
 import Plot from 'react-plotly.js';
 import {
   Search,
@@ -142,9 +143,11 @@ interface AnalysisData {
   };
 }
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:8000' : ''))
-  .replace(/\/+$/, '')
-  .replace(/\/api$/i, '');
+const API_BASE_URL = resolveApiBaseUrl(
+  import.meta.env.VITE_API_BASE_URL,
+  import.meta.env.DEV ? 'development' : 'production',
+  import.meta.env.DEV ? `http://${window.location.hostname}:8000` : '',
+);
 const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS) || 180_000;
 const displayOptional = (value: number | string | null | undefined) => value == null ? 'Unavailable' : value;
 
@@ -152,7 +155,7 @@ async function apiFetch(path: string, signal?: AbortSignal) {
   if (!API_BASE_URL) throw new Error('The analysis API is not configured. Set VITE_API_BASE_URL to the Render backend URL and redeploy.');
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, { signal });
+    response = await fetch(buildApiUrl(API_BASE_URL, path), { signal });
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error;
     throw new Error('Could not connect to the analysis service. Check your connection and try again.');
