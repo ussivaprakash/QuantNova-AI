@@ -54,6 +54,9 @@ def audit_ohlcv_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any],
             "Affected Count": 0
         })
 
+    if cleaned.empty:
+        raise ValueError("No complete OHLCV rows remain after excluding incomplete provider data.")
+
     # Duplicate dates check
     duplicates_mask = cleaned.duplicated(subset=["Date"], keep="first")
     duplicate_count = duplicates_mask.sum()
@@ -75,17 +78,17 @@ def audit_ohlcv_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any],
 
     # 2. Missing Values Audit & Imputation
     null_counts = cleaned[req_cols].isnull().sum()
-    total_nulls = null_counts.sum()
-    if total_nulls > 0:
-        # Forward fill price data, fill volume with 0
-        price_cols = ["Open", "High", "Low", "Close", "Adj Close"]
-        cleaned[price_cols] = cleaned[price_cols].ffill().bfill()
-        cleaned["Volume"] = cleaned["Volume"].fillna(0)
+    total_nulls = int(null_counts.sum())
+    missing_rows = cleaned[req_cols].isnull().any(axis=1)
+    rows_with_missing_values = int(missing_rows.sum())
+    if rows_with_missing_values > 0:
+        # Exclude incomplete provider rows; forward/back filling would invent OHLCV observations.
+        cleaned = cleaned.loc[~missing_rows].reset_index(drop=True)
         report_items.append({
             "Check Category": "Missing Values",
-            "Issue Found": f"Found {total_nulls} missing values across OHLCV columns",
-            "Action Taken": "Forward-filled prices and zero-filled missing volume",
-            "Affected Count": total_nulls
+            "Issue Found": f"Found {total_nulls} missing values in {rows_with_missing_values} rows",
+            "Action Taken": "Excluded incomplete rows from quantitative calculations",
+            "Affected Count": rows_with_missing_values
         })
     else:
         report_items.append({
@@ -94,6 +97,9 @@ def audit_ohlcv_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any],
             "Action Taken": "Verified 0 null or NaN values",
             "Affected Count": 0
         })
+
+    if cleaned.empty:
+        raise ValueError("No complete OHLCV rows remain after excluding incomplete provider data.")
 
     # 3. Price Integrity Anomalies
     # Rule 3a: Non-positive prices
@@ -198,7 +204,8 @@ def audit_ohlcv_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any],
         "Initial Rows": initial_rows,
         "Cleaned Rows": len(cleaned),
         "Duplicates Removed": duplicate_count,
-        "Missing Values Imputed": total_nulls,
+        "Missing Values Imputed": 0,
+        "Rows Excluded for Missing Values": rows_with_missing_values,
         "Price Range Violations Fixed": violation_count,
         "Volume Anomalies Sanitized": neg_vol_count,
         "Corporate Action Events Detected": split_div_count,

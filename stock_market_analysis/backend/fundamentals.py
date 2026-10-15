@@ -20,6 +20,7 @@ Computes:
 """
 
 from typing import Dict, Any
+from datetime import datetime, timezone
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -38,74 +39,101 @@ def analyze_fundamentals(ticker_symbol: str, db=None) -> Dict[str, Any]:
             stock = StockRepository.get_by_symbol(db, ticker_symbol)
             if stock:
                 cached = FundamentalsRepository.get_latest(db, stock.id)
-                if cached and cached.raw_metrics:
-                    return cached.raw_metrics
+                if (cached and cached.raw_metrics
+                        and cached.raw_metrics.get("data_source") == "yahoo_finance"
+                        and cached.raw_metrics.get("retrieved_at")):
+                    fetched = datetime.fromisoformat(cached.raw_metrics["retrieved_at"])
+                    if (datetime.now(timezone.utc) - fetched.astimezone(timezone.utc)).total_seconds() < 86400:
+                        return cached.raw_metrics
         except Exception:
             pass
 
+    provider_error = None
     try:
         ticker = yf.Ticker(ticker_symbol)
         info = ticker.info or {}
-    except Exception:
+    except Exception as exc:
         info = {}
+        provider_error = type(exc).__name__
 
-    # Extract Key Metrics with Fallbacks
+    # Missing provider fields stay missing; they are never replaced by sector averages.
     rev_growth = info.get("revenueGrowth", None)
     if rev_growth is not None:
         rev_growth = round(rev_growth * 100.0, 2)
-    else:
-        rev_growth = 12.5  # Sector baseline default
 
     profit_growth = info.get("earningsGrowth", None)
     if profit_growth is not None:
         profit_growth = round(profit_growth * 100.0, 2)
-    else:
-        profit_growth = 15.2
 
     eps_trailing = info.get("trailingEps", None)
     if eps_trailing is None:
-        eps_trailing = info.get("forwardEps", 18.5)
+        eps_trailing = info.get("forwardEps")
 
     pe_ratio = info.get("trailingPE", None)
     if pe_ratio is None:
-        pe_ratio = info.get("forwardPE", 22.4)
+        pe_ratio = info.get("forwardPE")
 
-    pb_ratio = info.get("priceToBook", 3.1)
+    pb_ratio = info.get("priceToBook")
     
     roe = info.get("returnOnEquity", None)
     if roe is not None:
         roe = round(roe * 100.0, 2)
-    else:
-        roe = 16.8
 
-    # ROCE approximation if not explicitly provided
-    roce = info.get("returnOnAssets", None)
+    roce = info.get("returnOnCapitalEmployed")
     if roce is not None:
-        roce = round(roce * 150.0, 2)  # Proxy relative multiplier
-    else:
-        roce = round(roe * 1.1, 2)
+        roce = round(roce * 100.0, 2)
 
     debt_to_equity = info.get("debtToEquity", None)
     if debt_to_equity is not None:
         debt_to_equity = round(debt_to_equity / 100.0, 2)
-    else:
-        debt_to_equity = 0.45
 
     free_cash_flow = info.get("freeCashflow", None)
     if free_cash_flow is None:
-        free_cash_flow = info.get("operatingCashflow", 0.0)
+        free_cash_flow = info.get("operatingCashflow")
 
-    promoter_holding = info.get("heldPercentInsiders", None)
-    if promoter_holding is not None:
-        promoter_holding = round(promoter_holding * 100.0, 2)
-    else:
-        promoter_holding = 46.5
+    # Yahoo's generic insider ownership is not equivalent to Indian promoter holding.
+    promoter_holding = None
 
     inst_holding = info.get("heldPercentInstitutions", None)
     if inst_holding is not None:
         inst_holding = round(inst_holding * 100.0, 2)
-    else:
-        inst_holding = 38.2
+
+    shares_outstanding = info.get("sharesOutstanding")
+
+    required_metrics = {
+        "Revenue Growth (%)": rev_growth,
+        "Profit Growth (%)": profit_growth,
+        "ROE (%)": roe,
+        "ROCE (%)": roce,
+        "PE Ratio": pe_ratio,
+        "PB Ratio": pb_ratio,
+        "Debt to Equity": debt_to_equity,
+        "Institutional Holding (%)": inst_holding,
+    }
+    missing_metrics = [name for name, value in required_metrics.items() if value is None]
+    metadata = {
+        "Ticker": ticker_symbol,
+        "Company Name": info.get("longName", ticker_symbol),
+        "Sector": info.get("sector", "Unknown"),
+        "Industry": info.get("industry", "Unknown"),
+        "EPS (Trailing)": eps_trailing,
+        "Free Cash Flow (₹)": free_cash_flow,
+        "Outstanding Shares": shares_outstanding,
+        **required_metrics,
+        "data_source": "yahoo_finance",
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if missing_metrics:
+        reason = f"Fundamental data is incomplete from Yahoo Finance: {', '.join(missing_metrics)}."
+        if provider_error:
+            reason += f" Provider request failed ({provider_error})."
+        return {
+            **metadata,
+            "Fundamental Score": None,
+            "Fundamental Rating": "Incomplete Data",
+            "Fundamental Summary": reason,
+            "Key Highlights": [],
+        }
 
     # --- Fundamental Scoring Algorithm (0-100) ---
     score = 0.0
@@ -169,14 +197,14 @@ def analyze_fundamentals(ticker_symbol: str, db=None) -> Dict[str, Any]:
     else:
         breakdown_reasons.append(f"High financial debt leverage ({debt_to_equity:.2f}x)")
 
-    if promoter_holding >= 40.0:
+    if promoter_holding is not None and promoter_holding >= 40.0:
         score += 6.5
         breakdown_reasons.append(f"High promoter skin-in-the-game ({promoter_holding:.1f}%)")
-    if inst_holding >= 30.0:
+    if inst_holding is not None and inst_holding >= 30.0:
         score += 6.0
         breakdown_reasons.append(f"Strong institutional backing ({inst_holding:.1f}%)")
 
-    final_score = int(min(max(score, 10), 98))
+    final_score = int(min(max(score, 0), 100))
 
     if final_score >= 80:
         rating = "Exceptional Fundamentals"
@@ -189,17 +217,19 @@ def analyze_fundamentals(ticker_symbol: str, db=None) -> Dict[str, Any]:
     else:
         rating = "Distressed Fundamentals"
 
+    if promoter_holding is None:
+        rating = f"Partial Data — {rating}"
     plain_english_summary = (
-        f"{ticker_symbol} demonstrates a Fundamental Score of {final_score}/100 ({rating}). "
-        f"Key operational highlights include: {'; '.join(breakdown_reasons[:4])}. "
-        f"Management maintains promoter ownership of {promoter_holding:.1f}% with institutional backing of {inst_holding:.1f}%."
+        f"{ticker_symbol} has a provider-data Fundamental Score of {final_score}/100 ({rating}). "
+        f"Measured highlights: {'; '.join(breakdown_reasons[:4]) or 'No positive scoring conditions were met'}. "
+        "Promoter ownership was not available from the data provider."
     )
 
     return {
         "Ticker": ticker_symbol,
         "Company Name": info.get("longName", ticker_symbol),
-        "Sector": info.get("sector", "Auto / Industrial"),
-        "Industry": info.get("industry", "Passenger Vehicles"),
+        "Sector": info.get("sector", "Unknown"),
+        "Industry": info.get("industry", "Unknown"),
         "Revenue Growth (%)": rev_growth,
         "Profit Growth (%)": profit_growth,
         "EPS (Trailing)": round(eps_trailing, 2) if isinstance(eps_trailing, (int, float)) else eps_trailing,
@@ -209,10 +239,13 @@ def analyze_fundamentals(ticker_symbol: str, db=None) -> Dict[str, Any]:
         "ROCE (%)": roce,
         "Debt to Equity": debt_to_equity,
         "Free Cash Flow (₹)": free_cash_flow,
+        "Outstanding Shares": shares_outstanding,
         "Promoter Holding (%)": promoter_holding,
         "Institutional Holding (%)": inst_holding,
         "Fundamental Score": final_score,
         "Fundamental Rating": rating,
         "Fundamental Summary": plain_english_summary,
         "Key Highlights": breakdown_reasons,
+        "data_source": "yahoo_finance",
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
     }

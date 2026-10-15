@@ -84,17 +84,24 @@ def train_and_evaluate_random_forest(df: pd.DataFrame) -> Tuple[pd.DataFrame, Di
     X, y, valid_df = build_prediction_features(df)
 
     if len(X) < 40:
-        # Fallback if dataset is very small
+        # No probability is reported when there is not enough historical evidence.
         res = df.copy()
-        res["ML Bull Prob (%)"] = 50.0
-        res["ML Prediction"] = "Neutral (Insufficient Data)"
-        res["ML Confidence"] = "Low"
+        res["ML Bull Prob (%)"] = np.nan
+        res["ML Prediction"] = "Unavailable (Insufficient Data)"
+        res["ML Confidence"] = "Unavailable"
         return res, {}, pd.DataFrame()
 
     # Chronological Split (70% Train, 30% Test)
     split_idx = int(len(X) * 0.70)
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+    if y_train.nunique() < 2:
+        res = df.copy()
+        res["ML Bull Prob (%)"] = np.nan
+        res["ML Prediction"] = "Unavailable (Insufficient Class Variation)"
+        res["ML Confidence"] = "Unavailable"
+        return res, {}, pd.DataFrame()
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
@@ -143,12 +150,19 @@ def train_and_evaluate_random_forest(df: pd.DataFrame) -> Tuple[pd.DataFrame, Di
 
     # Full Dataset Predictions for Downstream Signal Engine
     X_all_scaled = scaler.transform(X)
-    all_probs = rf_model.predict_proba(X_all_scaled)[:, 1] * 100.0
+    class_one = np.flatnonzero(rf_model.classes_ == 1)
+    if not len(class_one):
+        res = df.copy()
+        res["ML Bull Prob (%)"] = np.nan
+        res["ML Prediction"] = "Unavailable (Insufficient Class Variation)"
+        res["ML Confidence"] = "Unavailable"
+        return res, metrics, feature_importance_df
+    all_probs = rf_model.predict_proba(X_all_scaled)[:, class_one[0]] * 100.0
 
     res = df.copy()
-    res["ML Bull Prob (%)"] = 50.0
-    res["ML Prediction"] = "Neutral / Mixed"
-    res["ML Confidence"] = "Low"
+    res["ML Bull Prob (%)"] = np.nan
+    res["ML Prediction"] = "Unavailable"
+    res["ML Confidence"] = "Unavailable"
 
     for i, orig_idx in enumerate(valid_df.index):
         prob = round(all_probs[i], 2)

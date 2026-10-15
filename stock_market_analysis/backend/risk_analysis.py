@@ -16,8 +16,14 @@ def analyze_risk_metrics(data: pd.DataFrame, portfolio_value: float = 100000.0) 
     """
     latest = data.iloc[-1]
     close_price = float(latest["Close"])
-    atr = float(latest.get("ATR (14)", close_price * 0.025))
-    volatility = float(latest.get("Rolling Volatility (20D Ann %)", 22.0))
+    atr_value = latest.get("ATR (14)")
+    volatility_value = latest.get("Rolling Volatility (20D Ann %)")
+    if pd.isna(atr_value) or float(atr_value) <= 0:
+        raise ValueError("Cannot calculate risk levels because the latest ATR is unavailable.")
+    if pd.isna(volatility_value):
+        raise ValueError("Cannot calculate risk because latest annualized volatility is unavailable.")
+    atr = float(atr_value)
+    volatility = float(volatility_value)
 
     # Stop Loss & Target Price Calculation based on ATR & Technical Levels
     stop_loss = round(close_price - (1.75 * atr), 2)
@@ -26,7 +32,9 @@ def analyze_risk_metrics(data: pd.DataFrame, portfolio_value: float = 100000.0) 
     risk_per_share = abs(close_price - stop_loss)
     reward_per_share = abs(target_price - close_price)
 
-    r2r_ratio = round(reward_per_share / risk_per_share, 2) if risk_per_share > 0 else 1.57
+    if risk_per_share <= 0:
+        raise ValueError("Cannot calculate risk-to-reward because per-share risk is zero.")
+    r2r_ratio = round(reward_per_share / risk_per_share, 2)
 
     # Risk Score Calculation (0-100)
     risk_score = 30.0
@@ -47,7 +55,7 @@ def analyze_risk_metrics(data: pd.DataFrame, portfolio_value: float = 100000.0) 
 
     # Position Sizing (Fixed 2% Risk Allocation Rule)
     max_portfolio_risk = portfolio_value * 0.02  # 2% max portfolio drawdown risk
-    recommended_shares = int(max_portfolio_risk / risk_per_share) if risk_per_share > 0 else 10
+    recommended_shares = int(max_portfolio_risk / risk_per_share)
     total_position_cost = round(recommended_shares * close_price, 2)
     position_pct = round((total_position_cost / portfolio_value) * 100.0, 1)
 

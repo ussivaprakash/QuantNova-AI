@@ -49,7 +49,7 @@ try:
         db_pool_recycle: int = Field(default=1800, alias="DB_POOL_RECYCLE")
 
         cors_origins: str = Field(
-            default="http://localhost:5173,http://localhost:3000,https://*.vercel.app",
+            default="http://localhost:5173,http://localhost:3000,https://quant-nova-ai-rprt.vercel.app",
             alias="CORS_ORIGINS"
         )
 
@@ -91,7 +91,7 @@ except ImportError:
             self.db_pool_recycle = int(os.getenv("DB_POOL_RECYCLE", "1800"))
             self.cors_origins = os.getenv(
                 "CORS_ORIGINS",
-                "http://localhost:5173,http://localhost:3000,https://*.vercel.app"
+                "http://localhost:5173,http://localhost:3000,https://quant-nova-ai-rprt.vercel.app"
             )
 
         @property

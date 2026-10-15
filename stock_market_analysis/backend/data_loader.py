@@ -41,34 +41,6 @@ PERIOD_DAYS_MAP = {
 }
 
 
-def generate_fallback_ohlcv(ticker: str, period: str = "1y") -> pd.DataFrame:
-    """Generate realistic daily OHLCV dataset for robust fallback when external network is blocked."""
-    import numpy as np
-    num_days = PERIOD_DAYS_MAP.get(period.lower(), 252)
-    end_date = pd.Timestamp.now()
-    dates = pd.date_range(end=end_date, periods=num_days, freq="B")
-    
-    base_price = 850.0 if "TATAMOTORS" in ticker else 2500.0 if "RELIANCE" in ticker else 350.0
-    np.random.seed(abs(hash(ticker + period)) % (2**32))
-    returns = np.random.normal(0.0005, 0.015, num_days)
-    close_prices = base_price * np.exp(np.cumsum(returns))
-    
-    open_prices = close_prices * (1 + np.random.normal(0, 0.005, num_days))
-    high_prices = np.maximum(open_prices, close_prices) * (1 + np.abs(np.random.normal(0, 0.008, num_days)))
-    low_prices = np.minimum(open_prices, close_prices) * (1 - np.abs(np.random.normal(0, 0.008, num_days)))
-    volume = np.random.randint(500000, 10000000, num_days)
-    
-    return pd.DataFrame({
-        "Date": dates,
-        "Open": open_prices,
-        "High": high_prices,
-        "Low": low_prices,
-        "Close": close_prices,
-        "Adj Close": close_prices,
-        "Volume": volume
-    })
-
-
 TICKER_ALIASES = {
     "TATAMOTORS.NS": ["TMPV.NS", "TATAMOTORS.BO", "TMPV.BO"],
     "TATAMOTORS": ["TMPV.NS", "TATAMOTORS.BO"],
@@ -79,67 +51,70 @@ def download_raw_data(config: PipelineConfig, db=None) -> pd.DataFrame:
     """
     Download raw daily OHLCV stock data from PostgreSQL database if cached,
     otherwise download from Yahoo Finance and persist to database.
-    Includes robust fallback periods and synthetic data generator if requested range fails.
+    Uses the requested period only. Missing provider data is an error, never a synthetic result.
     """
     raw_ticker = config.ticker.strip().upper()
     if " " in raw_ticker:
         raw_ticker = raw_ticker.replace(" ", "")
 
     period_req = config.period.lower() if config.period else "1y"
-    num_days_target = PERIOD_DAYS_MAP.get(period_req, 2520)
+    if period_req not in PERIOD_DAYS_MAP:
+        raise ValueError(f"Unsupported analysis period '{period_req}'. Choose one of: {', '.join(PERIOD_DAYS_MAP)}.")
+    num_days_target = PERIOD_DAYS_MAP[period_req]
 
     # 1. Try reading from PostgreSQL Database first if db session is provided
     if db is not None:
         try:
             from repositories.stock_repo import StockRepository
             from repositories.market_data_repo import MarketDataRepository
+            from repositories.fundamentals_repo import FundamentalsRepository
 
             stock = StockRepository.get_by_symbol(db, raw_ticker)
             if stock:
+                provenance = FundamentalsRepository.get_latest(db, stock.id)
+                source_metrics = provenance.raw_metrics if provenance else {}
+                trusted_source = source_metrics.get("data_source") == "yahoo_finance"
+                if not trusted_source:
+                    raise ValueError(f"Cached market data for {raw_ticker} has no verified live-data provenance.")
                 cached_bars = MarketDataRepository.get_bars_by_stock_id(db, stock.id)
                 if len(cached_bars) >= min(num_days_target, 20):
                     df_db = MarketDataRepository.to_dataframe(cached_bars)
+                    latest_cached = pd.to_datetime(df_db["Date"]).max()
+                    cache_age_days = (pd.Timestamp.now(tz="UTC").tz_localize(None).normalize() - latest_cached.tz_localize(None).normalize() if latest_cached.tzinfo else pd.Timestamp.now().normalize() - latest_cached.normalize()).days
+                    if cache_age_days > 7:
+                        raise ValueError(f"Cached market data for {raw_ticker} is stale ({cache_age_days} days old).")
                     if len(df_db) > num_days_target:
                         df_db = df_db.tail(num_days_target).reset_index(drop=True)
+                    df_db.attrs["data_source"] = "postgresql_cache"
                     print(f"      ✓ Retrieved {len(df_db)} OHLCV bars from PostgreSQL cache for {raw_ticker}")
                     return df_db
         except Exception as e:
-            print(f"      ⚠️ Database cache check failed ({e}), proceeding with external download...")
+            print(f"      ⚠️ Database cache check failed (error_type={type(e).__name__}), proceeding with external download...")
 
     # 2. External Download via Yahoo Finance
     tickers_to_try = [raw_ticker]
     if raw_ticker in TICKER_ALIASES:
         tickers_to_try.extend(TICKER_ALIASES[raw_ticker])
 
-    periods_to_try = [period_req, "max", "5y", "1y", "6m"]
     data = pd.DataFrame()
+    provider_errors = []
 
     for sym in tickers_to_try:
-        for p in dict.fromkeys(periods_to_try):
-            try:
-                ticker_obj = yf.Ticker(sym)
-                downloaded = ticker_obj.history(period=p, interval=config.interval)
-                if downloaded.empty:
-                    downloaded = yf.download(
-                        tickers=sym,
-                        period=p,
-                        interval=config.interval,
-                        auto_adjust=False,
-                        progress=False,
-                        threads=False,
-                    )
-                if not downloaded.empty and len(downloaded) > 5:
-                    data = downloaded
-                    print(f"      ✓ Successfully retrieved live market data for symbol: {sym} ({len(data)} rows)")
-                    break
-            except Exception:
-                continue
+        try:
+            downloaded = yf.Ticker(sym).history(period=period_req, interval=config.interval, timeout=15)
+            if not downloaded.empty and len(downloaded) > 5:
+                data = downloaded
+                print(f"      ✓ Successfully retrieved live market data for symbol: {sym} ({len(data)} rows)")
+                break
+            provider_errors.append(f"{sym}: no data for requested period {period_req}")
+        except Exception as exc:
+            provider_errors.append(f"{sym}: {type(exc).__name__}")
         if not data.empty:
             break
 
     if data.empty:
-        print("      ⚠️ External download failed for all ticker aliases. Generating synthetic fallback data...")
-        return generate_fallback_ohlcv(raw_ticker, period_req)
+        error_summary = "; ".join(provider_errors)
+        raise ValueError(f"Yahoo Finance returned no live OHLCV data for '{raw_ticker}' for period {period_req}. Check the symbol or retry later. Provider details: {error_summary}")
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
@@ -153,9 +128,13 @@ def download_raw_data(config: PipelineConfig, db=None) -> pd.DataFrame:
     expected_columns = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
     missing_columns = [col for col in expected_columns if col not in data.columns]
     if missing_columns:
-        return generate_fallback_ohlcv(raw_ticker, period_req)
+        raise ValueError(f"Market data provider returned incomplete live data for '{raw_ticker}' (missing: {', '.join(missing_columns)}).")
 
     result_df = data[expected_columns].sort_values("Date").reset_index(drop=True)
+    if result_df.empty or result_df[["Open", "High", "Low", "Close", "Volume"]].isna().any().any():
+        raise ValueError(f"Yahoo Finance returned incomplete OHLCV rows for '{raw_ticker}'. No analysis was produced.")
+    if (result_df[["Open", "High", "Low", "Close"]] <= 0).any().any() or (result_df["Volume"] < 0).any():
+        raise ValueError(f"Yahoo Finance returned invalid OHLCV values for '{raw_ticker}'. No analysis was produced.")
     if len(result_df) > num_days_target:
         result_df = result_df.tail(num_days_target).reset_index(drop=True)
 
@@ -185,7 +164,8 @@ def download_raw_data(config: PipelineConfig, db=None) -> pd.DataFrame:
             MarketDataRepository.bulk_upsert(db, stock.id, bars_to_upsert)
             print(f"      ✓ Persisted {len(bars_to_upsert)} bars to PostgreSQL for {raw_ticker}")
         except Exception as e:
-            print(f"      ⚠️ Failed to cache market data in DB: {e}")
+            print(f"      ⚠️ Failed to cache market data in DB (error_type={type(e).__name__})")
 
+    result_df.attrs["data_source"] = "yahoo_finance"
     return result_df
 

@@ -8,7 +8,6 @@ volume metrics, delivery context, and benchmark/sector index context for Indian 
 from typing import Dict, Any, List, Optional
 import yfinance as yf
 import pandas as pd
-import numpy as np
 
 
 class MarketDataProvider:
@@ -22,34 +21,37 @@ class MarketDataProvider:
             fast_info = getattr(ticker, "fast_info", {})
             
             # Fetch 5-day history for recent price change
-            hist = ticker.history(period="5d")
+            hist = ticker.history(period="5d", timeout=15)
             if not hist.empty:
                 latest_close = float(hist["Close"].iloc[-1])
-                prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else float(info.get("previousClose", latest_close))
-                change = round(latest_close - prev_close, 2)
-                p_change = round((change / prev_close) * 100.0, 2) if prev_close > 0 else 0.0
+                prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else info.get("previousClose")
+                change = round(latest_close - prev_close, 2) if prev_close else None
+                p_change = round((change / prev_close) * 100.0, 2) if change is not None and prev_close > 0 else None
                 open_price = float(hist["Open"].iloc[-1])
                 high_price = float(hist["High"].iloc[-1])
                 low_price = float(hist["Low"].iloc[-1])
                 volume = int(hist["Volume"].iloc[-1])
                 avg_vol_20d = int(hist["Volume"].mean())
             else:
-                latest_close = float(info.get("currentPrice", info.get("regularMarketPrice", 500.0)))
-                prev_close = float(info.get("previousClose", latest_close))
-                change = round(latest_close - prev_close, 2)
-                p_change = round(info.get("regularMarketChangePercent", 0.0), 2)
-                open_price = float(info.get("open", latest_close))
-                high_price = float(info.get("dayHigh", latest_close * 1.01))
-                low_price = float(info.get("dayLow", latest_close * 0.99))
-                volume = int(info.get("volume", 1000000))
-                avg_vol_20d = int(info.get("averageVolume", 1000000))
+                latest_close = info.get("currentPrice", info.get("regularMarketPrice"))
+                if latest_close is None:
+                    return {"symbol": symbol, "error": "Yahoo Finance returned no current quote."}
+                latest_close = float(latest_close)
+                prev_close = info.get("previousClose")
+                change = round(latest_close - prev_close, 2) if prev_close else None
+                p_change = round(info["regularMarketChangePercent"], 2) if info.get("regularMarketChangePercent") is not None else None
+                open_price = info.get("open")
+                high_price = info.get("dayHigh")
+                low_price = info.get("dayLow")
+                volume = info.get("volume")
+                avg_vol_20d = info.get("averageVolume")
 
-            vol_ratio = round(volume / max(avg_vol_20d, 1), 2)
+            vol_ratio = round(volume / avg_vol_20d, 2) if volume is not None and avg_vol_20d else None
 
             return {
                 "symbol": symbol,
                 "company_name": info.get("longName", info.get("shortName", symbol)),
-                "currency": "INR",
+                "currency": info.get("currency"),
                 "current_price": latest_close,
                 "previous_close": prev_close,
                 "change": change,
@@ -60,28 +62,25 @@ class MarketDataProvider:
                 "volume": volume,
                 "avg_volume_20d": avg_vol_20d,
                 "volume_ratio": vol_ratio,
-                "market_cap": info.get("marketCap", 0),
-                "52w_high": info.get("fiftyTwoWeekHigh", high_price),
-                "52w_low": info.get("fiftyTwoWeekLow", low_price),
-                "day_range": f"₹{low_price:.2f} - ₹{high_price:.2f}",
-                "52w_range": f"₹{info.get('fiftyTwoWeekLow', low_price):.2f} - ₹{info.get('fiftyTwoWeekHigh', high_price):.2f}"
+                "market_cap": info.get("marketCap"),
+                "52w_high": info.get("fiftyTwoWeekHigh"),
+                "52w_low": info.get("fiftyTwoWeekLow"),
+                "day_range": f"{low_price} - {high_price}" if low_price is not None and high_price is not None else None,
+                "52w_range": f"{info.get('fiftyTwoWeekLow')} - {info.get('fiftyTwoWeekHigh')}" if info.get("fiftyTwoWeekLow") is not None and info.get("fiftyTwoWeekHigh") is not None else None
             }
         except Exception as e:
             return {
                 "symbol": symbol,
-                "error": f"Failed to fetch market quote: {str(e)}",
-                "current_price": 0.0,
-                "percent_change": 0.0,
-                "volume": 0
+                "error": f"Failed to fetch market quote ({type(e).__name__})."
             }
 
     def get_intraday(self, symbol: str) -> Dict[str, Any]:
         """Fetches 1-day intraday 5m price movement series."""
         try:
             ticker = yf.Ticker(symbol)
-            df = ticker.history(period="1d", interval="5m")
+            df = ticker.history(period="1d", interval="5m", timeout=15)
             if df.empty:
-                df = ticker.history(period="5d", interval="15m")
+                df = ticker.history(period="5d", interval="15m", timeout=15)
 
             if not df.empty:
                 times = [t.strftime("%H:%M") for t in df.index]
@@ -95,10 +94,10 @@ class MarketDataProvider:
                     "intraday_low": float(df["Low"].min()),
                     "vwap": round(float((df["Close"] * df["Volume"]).sum() / max(df["Volume"].sum(), 1)), 2)
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            return {"timestamps": [], "prices": [], "volumes": [], "error": f"Market data unavailable ({type(exc).__name__})."}
 
-        return {"timestamps": [], "prices": [], "volumes": [], "intraday_high": 0.0, "intraday_low": 0.0, "vwap": 0.0}
+        return {"timestamps": [], "prices": [], "volumes": [], "error": "Yahoo Finance returned no intraday data."}
 
     def get_market_context(self, symbol: str = "TATAMOTORS.NS") -> Dict[str, Any]:
         """Fetches Indian benchmark market indicators (NIFTY 50, SENSEX, Sector Index)."""
@@ -111,20 +110,20 @@ class MarketDataProvider:
 
         return {
             "nifty_50": {
-                "price": nifty.get("current_price", 24500.0),
-                "change": nifty.get("change", 0.0),
-                "percent_change": nifty.get("percent_change", 0.0),
-                "trend": "Bullish" if nifty.get("percent_change", 0) > 0.2 else "Bearish" if nifty.get("percent_change", 0) < -0.2 else "Neutral"
+                "price": nifty.get("current_price"),
+                "change": nifty.get("change"),
+                "percent_change": nifty.get("percent_change"),
+                "trend": "Unavailable" if nifty.get("percent_change") is None else "Bullish" if nifty["percent_change"] > 0.2 else "Bearish" if nifty["percent_change"] < -0.2 else "Neutral"
             },
             "sensex": {
-                "price": sensex.get("current_price", 80200.0),
-                "change": sensex.get("change", 0.0),
-                "percent_change": sensex.get("percent_change", 0.0),
+                "price": sensex.get("current_price"),
+                "change": sensex.get("change"),
+                "percent_change": sensex.get("percent_change"),
             },
             "sector_index": {
                 "name": "NIFTY Auto Index" if "CNXAUTO" in sector_symbol else "NIFTY Bank Index" if "NSEBANK" in sector_symbol else "NIFTY IT Index",
                 "symbol": sector_symbol,
-                "price": sector_quote.get("current_price", 22000.0),
-                "percent_change": sector_quote.get("percent_change", 0.0)
+                "price": sector_quote.get("current_price"),
+                "percent_change": sector_quote.get("percent_change")
             }
         }

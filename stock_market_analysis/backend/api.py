@@ -16,13 +16,17 @@ import urllib.request
 import urllib.parse
 from typing import Dict, Any, List, Optional
 import sys
+import logging
+import uuid
+import time
 from contextlib import asynccontextmanager
 import pandas as pd
 import numpy as np
 
-from fastapi import FastAPI, Query, HTTPException, Response, Depends
+from fastapi import FastAPI, Query, HTTPException, Response, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.orm import Session
 
 # Add current directory to python path
@@ -55,6 +59,35 @@ from risk_analysis import analyze_risk_metrics
 from dashboard import generate_html_dashboard, export_to_excel_workbook
 from pdf_exporter import generate_pdf_report
 
+logger = logging.getLogger("quantnova.api")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            logger.info("request_id=%s method=%s path=%s status=%s duration_ms=%.1f", request_id, request.method, request.url.path, response.status_code, (time.perf_counter() - started) * 1000)
+            return response
+        except Exception:
+            logger.exception("request_id=%s method=%s path=%s duration_ms=%.1f", request_id, request.method, request.url.path, (time.perf_counter() - started) * 1000)
+            raise
+
+
+def timed_stage(name, function, *args, timings=None, **kwargs):
+    started = time.perf_counter()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        duration_ms = (time.perf_counter() - started) * 1000
+        if timings is not None:
+            timings[name] = round(duration_ms, 1)
+        logger.info("stage=%s duration_ms=%.1f", name, duration_ms)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -71,10 +104,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="QuantNova AI - Quantitative Stock Intelligence API",
-    description="Institutional 13-Stage Quantitative Analysis & AI Intelligence Platform API with PostgreSQL persistence",
+    description="10-stage quantitative stock analysis API with optional PostgreSQL persistence",
     version="2.0.0",
     lifespan=lifespan,
 )
+app.add_middleware(RequestLoggingMiddleware)
 
 # Enable CORS for Vite React / Vercel frontend
 allowed_origins = [
@@ -111,6 +145,15 @@ def sanitize_json(obj):
         return str(obj)
     else:
         return obj
+
+
+def numeric_or_none(value, digits: Optional[int] = None):
+    if value is None or pd.isna(value):
+        return None
+    number = float(value)
+    if not np.isfinite(number):
+        return None
+    return round(number, digits) if digits is not None else number
 
 # Comprehensive Stock Symbols Database for Autocomplete & Search
 STOCK_DATABASE = [
@@ -158,6 +201,10 @@ def resolve_symbol(raw_input: str) -> str:
     query_upper = query.upper()
     if query_upper in ["TATAMOTORS.NS", "TATAMOTORS", "TMPV.NS"]:
         return "TMPV.NS"
+    if query_upper.startswith("^") or "=" in query_upper:
+        return query_upper
+    if query_upper.endswith((".NS", ".BO")):
+        return query_upper
 
 
     # 1. Exact or partial match in local database
@@ -199,12 +246,11 @@ def resolve_symbol(raw_input: str) -> str:
 
 @app.get("/api/health")
 def health_check():
-    db_connected = check_database_connection()
     return {
         "status": "online",
         "engine": "Quantitative Signal Engine v2.0",
-        "database": "connected" if db_connected else "fallback_mode",
-        "active_stages": 13,
+        "pipeline_stages": 10,
+        "active_stages": 10,
     }
 
 
@@ -287,10 +333,8 @@ def search_stocks(
         except Exception:
             pass
 
-    return matches if matches else [{"symbol": f"{query_upper}.NS", "name": f"Search Ticker: {query_upper}", "exchange": "NSE/BSE"}]
+    return matches
 
-
-import time
 
 ANALYSIS_CACHE: Dict[str, Any] = {}
 CACHE_TTL_SECONDS = 300  # 5 minutes cache
@@ -298,8 +342,9 @@ CACHE_TTL_SECONDS = 300  # 5 minutes cache
 
 @app.get("/api/analyze")
 def analyze_stock(
+    request: Request,
     symbol: str = Query("TATAMOTORS.NS", description="Stock Ticker Symbol"),
-    period: str = Query("1y", description="Timeframe: 1m, 3m, 6m, 1y, 5y, max"),
+    period: str = Query("1y", pattern="^(1m|3m|6m|1y|3y|5y|max)$", description="Timeframe: 1m, 3m, 6m, 1y, 3y, 5y, max"),
     db: Session = Depends(get_db),
 ):
     ticker_clean = resolve_symbol(symbol)
@@ -313,37 +358,38 @@ def analyze_stock(
             return JSONResponse(content=cached_payload)
 
     try:
+        stage_timings: Dict[str, float] = {}
         config = PipelineConfig(ticker=ticker_clean, period=period)
 
         # Stage 1: Data Collection (PostgreSQL Cache first, Yahoo fallback)
-        raw_df = download_raw_data(config, db=db)
+        raw_df = timed_stage("1_data_collection", download_raw_data, config, timings=stage_timings, db=db)
 
         # Stage 2: Data Cleaning
-        cleaned_df, audit_summary, audit_report_df = audit_ohlcv_dataset(raw_df)
+        cleaned_df, audit_summary, audit_report_df = timed_stage("2_data_cleaning", audit_ohlcv_dataset, raw_df, timings=stage_timings)
 
         # Stage 3: Technical Indicators
-        df_indicators = calculate_all_indicators(cleaned_df, config)
+        df_indicators = timed_stage("3_indicators", calculate_all_indicators, cleaned_df, config, timings=stage_timings)
 
         # Stage 4: Trend Analysis
-        df_trend = analyze_trend_regime(df_indicators)
+        df_trend = timed_stage("4_trend", analyze_trend_regime, df_indicators, timings=stage_timings)
 
         # Stage 5: Fundamental Analysis (PostgreSQL Cache first, Yahoo fallback)
-        fund_data = analyze_fundamentals(ticker_clean, db=db)
+        fund_data = timed_stage("5_fundamentals", analyze_fundamentals, ticker_clean, timings=stage_timings, db=db)
 
         # Stage 6: Market Context Analysis
-        market_ctx = analyze_market_context(df_trend)
+        market_ctx = timed_stage("6_market_context", analyze_market_context, df_trend, timings=stage_timings)
 
         # Stage 7: Machine Learning Model
-        df_ml, rf_metrics, feature_importance_df = train_and_evaluate_random_forest(df_trend)
+        df_ml, rf_metrics, feature_importance_df = timed_stage("7_machine_learning", train_and_evaluate_random_forest, df_trend, timings=stage_timings)
 
         # Stage 8: Trading Signal Engine
-        df_signals = generate_buy_hold_sell_signals(df_ml)
+        df_signals = timed_stage("8_signals", generate_buy_hold_sell_signals, df_ml, timings=stage_timings)
 
         # Stage 9: Risk Analysis
-        risk_data = analyze_risk_metrics(df_signals)
+        risk_data = timed_stage("9_risk", analyze_risk_metrics, df_signals, timings=stage_timings)
 
         # Stage 10: Strategy Backtest
-        backtest_df, backtest_metrics_df, trade_log_df = run_strategy_backtest(df_signals)
+        backtest_df, backtest_metrics_df, trade_log_df = timed_stage("10_backtesting", run_strategy_backtest, df_signals, timings=stage_timings)
 
         latest_row = backtest_df.iloc[-1]
 
@@ -373,9 +419,44 @@ def analyze_stock(
 
         # Latest Signal Details
         close_price = float(latest_row["Close"])
-        atr = float(latest_row.get("ATR (14)", close_price * 0.02))
-        stop_loss = float(risk_data.get("Suggested Stop Loss (₹)", close_price - 1.5 * atr))
-        target_price = float(risk_data.get("Suggested Target Price (₹)", close_price + 2.5 * atr))
+        atr = float(latest_row["ATR (14)"])
+        stop_loss = float(risk_data["Suggested Stop Loss (₹)"])
+        target_price = float(risk_data["Suggested Target Price (₹)"])
+
+        rsi = numeric_or_none(latest_row.get("RSI (14)"), 2)
+        macd_hist = numeric_or_none(latest_row.get("MACD Histogram"), 2)
+        sma20 = numeric_or_none(latest_row.get("SMA 20"), 2)
+        sma50 = numeric_or_none(latest_row.get("SMA 50"), 2)
+        adx = numeric_or_none(latest_row.get("ADX (14)"), 2)
+        vwap = numeric_or_none(latest_row.get("VWAP"), 2)
+        obv = numeric_or_none(latest_row.get("OBV"))
+        supertrend = numeric_or_none(latest_row.get("SuperTrend"), 2)
+        support1 = numeric_or_none(latest_row.get("Support 1"), 2)
+        resistance1 = numeric_or_none(latest_row.get("Resistance 1"), 2)
+        technical_score = numeric_or_none(latest_row.get("Technical Score"))
+        signal = latest_row["Signal"]
+        trend_classification = latest_row["Trend Classification"]
+        trend_reason = latest_row["Trend Reason"]
+        fundamental_score = fund_data.get("Fundamental Score")
+        pros = []
+        cons = []
+        if macd_hist is not None and macd_hist > 0:
+            pros.append("MACD histogram is positive.")
+        if sma50 is not None and close_price > sma50:
+            pros.append("Price is above its 50-day moving average.")
+        if rsi is not None and 50 <= rsi < 70:
+            pros.append(f"RSI is in positive, non-overbought territory ({rsi:.1f}).")
+        if not pros:
+            pros.append("No positive technical confirmation was identified in the latest calculated indicators.")
+        if macd_hist is not None and macd_hist < 0:
+            cons.append("MACD histogram is negative.")
+        if sma50 is not None and close_price < sma50:
+            cons.append("Price is below its 50-day moving average.")
+        if rsi is not None and rsi >= 70:
+            cons.append(f"RSI is elevated ({rsi:.1f}).")
+        if not cons:
+            cons.append("No negative confirmation was identified in the latest calculated indicators.")
+        risks = [f"A move through the calculated stop-loss level of ₹{stop_loss:.2f} invalidates this setup."]
         
         response_payload = {
             "symbol": ticker_clean,
@@ -383,6 +464,7 @@ def analyze_stock(
             "sector": fund_data.get("Sector", "General Equities"),
             "latest_price": close_price,
             "date": latest_row["Date"].strftime("%Y-%m-%d"),
+            "market_data_source": raw_df.attrs.get("data_source", "unknown"),
             "stage_1_collection": {
                 "records_count": len(raw_df),
                 "date_min": raw_df["Date"].min().strftime("%Y-%m-%d"),
@@ -390,30 +472,30 @@ def analyze_stock(
             },
             "stage_2_cleaning": audit_summary,
             "stage_3_indicators": {
-                "rsi": round(float(latest_row.get("RSI (14)", 50)), 2),
-                "macd_hist": round(float(latest_row.get("MACD Histogram", 0)), 2),
-                "sma20": round(float(latest_row.get("SMA 20", latest_row.get("20-Day MA", close_price))), 2),
-                "sma50": round(float(latest_row.get("SMA 50", close_price)), 2),
+                "rsi": rsi,
+                "macd_hist": macd_hist,
+                "sma20": sma20,
+                "sma50": sma50,
                 "atr": round(float(atr), 2),
-                "adx": round(float(latest_row.get("ADX (14)", 20)), 2),
-                "vwap": round(float(latest_row.get("VWAP", close_price)), 2),
-                "obv": float(latest_row.get("OBV", 0)),
-                "supertrend": round(float(latest_row.get("SuperTrend", close_price)), 2),
-                "support1": round(float(latest_row.get("Support 1", close_price * 0.95)), 2),
-                "resistance1": round(float(latest_row.get("Resistance 1", close_price * 1.05)), 2),
+                "adx": adx,
+                "vwap": vwap,
+                "obv": obv,
+                "supertrend": supertrend,
+                "support1": support1,
+                "resistance1": resistance1,
             },
             "stage_4_trend": {
-                "classification": latest_row.get("Trend Classification", "Sideways"),
-                "score": int(latest_row.get("Trend Score", 0)),
-                "reason": latest_row.get("Trend Reason", "Balanced indicators."),
-                "ma20_slope": round(float(latest_row.get("MA20 Slope (%)", 0)), 2),
+                "classification": trend_classification,
+                "score": int(latest_row["Trend Score"]),
+                "reason": trend_reason,
+                "ma20_slope": numeric_or_none(latest_row.get("MA20 Slope (%)"), 2),
             },
             "stage_5_fundamentals": fund_data,
             "stage_6_market_context": market_ctx,
             "stage_7_machine_learning": {
-                "bullish_probability": round(float(latest_row.get("ML Bull Prob (%)", 50.0)), 2),
-                "prediction": latest_row.get("ML Prediction", "Neutral"),
-                "confidence": latest_row.get("ML Confidence", "Low"),
+                "bullish_probability": numeric_or_none(latest_row.get("ML Bull Prob (%)"), 2),
+                "prediction": latest_row.get("ML Prediction", "Unavailable"),
+                "confidence": latest_row.get("ML Confidence", "Unavailable"),
                 "metrics": rf_metrics,
                 "feature_importances": feature_importance_df.to_dict(orient="records") if not feature_importance_df.empty else [],
             },
@@ -424,40 +506,33 @@ def analyze_stock(
             },
             "stage_9_risk_analysis": risk_data,
             "stage_10_decision_engine": {
-                "signal": latest_row.get("Signal", "HOLD / WAIT"),
-                "confidence_score": int(latest_row.get("Signal Confidence (%)", 40)),
-                "technical_score": int(latest_row.get("Technical Score", 65)),
-                "fundamental_score": fund_data.get("Fundamental Score", 75),
-                "risk_score": risk_data.get("Risk Score", 35),
-                "risk_level": risk_data.get("Risk Category", "Moderate Risk"),
+                "signal": signal,
+                "confidence_score": int(latest_row["Signal Confidence (%)"]),
+                "technical_score": technical_score,
+                "fundamental_score": fundamental_score,
+                "risk_score": risk_data["Risk Score"],
+                "risk_level": risk_data["Risk Category"],
                 "entry_price": close_price,
                 "stop_loss": stop_loss,
                 "target_price": target_price,
-                "risk_reward_ratio": risk_data.get("Risk-to-Reward Ratio", "1:1.67"),
+                "risk_reward_ratio": risk_data["Risk-to-Reward Ratio"],
                 "expected_time_horizon": "1 - 3 Months Swing / Position",
-                "pros": [
-                    "Strong price support established at Pivot S1 level",
-                    "MACD Histogram exhibiting positive momentum crossover",
-                    "Fundamental health backed by high promoter equity skin-in-the-game"
-                ],
-                "cons": [
-                    "Sector relative strength undergoing short-term consolidation",
-                    "ATR volatility expanding near upper resistance band"
-                ],
-                "risks": [
-                    "Macro interest rate fluctuations impacting auto/industrial sector margins",
-                    "Break of ATR stop loss level at ₹" + str(stop_loss)
-                ],
-                "reason_for_decision": latest_row.get("Reason for Decision", "Indicator alignment."),
+                "pros": pros,
+                "cons": cons,
+                "risks": risks,
+                "reason_for_decision": latest_row["Reason for Decision"],
                 "ai_explanation": (
-                    f"{ticker_clean} is holding above key baseline levels with an overall Technical Score of "
-                    f"{int(latest_row.get('Technical Score', 65))}/100 and a Fundamental Score of {fund_data.get('Fundamental Score', 75)}/100. "
-                    f"RSI indicates healthy momentum ({latest_row.get('RSI (14)', 50):.1f}), MACD is positive, and historical backtesting "
-                    f"shows out-of-sample risk reduction (+23.35% drawdown preservation). Overall rating is {latest_row.get('Signal', 'BUY')} "
-                    f"with {risk_data.get('Risk Category', 'Moderate Risk')}."
+                    f"{ticker_clean}: signal {signal}, technical score {technical_score}/100, "
+                    f"fundamental score {fundamental_score if fundamental_score is not None else 'unavailable'}, "
+                    f"RSI {rsi if rsi is not None else 'unavailable'}, MACD histogram {macd_hist if macd_hist is not None else 'unavailable'}, "
+                    f"trend {trend_classification}. Fundamentals are informational only and are not substituted when provider fields are missing."
                 )
             },
             "chart_series": chart_series,
+            "pipeline_stages": [
+                {"name": name, "status": "completed", "duration_ms": duration}
+                for name, duration in stage_timings.items()
+            ],
         }
 
         # Persist Analysis Snapshot, Trading Signal, and Risk Assessment to PostgreSQL
@@ -473,12 +548,12 @@ def analyze_stock(
             snapshot = AnalysisRepository.create_snapshot(db, stock.id, {
                 "period": period,
                 "latest_price": close_price,
-                "trend_classification": str(latest_row.get("Trend Classification", "Sideways")),
-                "trend_score": int(latest_row.get("Trend Score", 0)),
-                "ma20_slope": float(latest_row.get("MA20 Slope (%)", 0)),
-                "ml_bullish_prob_pct": float(latest_row.get("ML Bull Prob (%)", 50.0)),
-                "ml_prediction": str(latest_row.get("ML Prediction", "Neutral")),
-                "ml_confidence": str(latest_row.get("ML Confidence", "Low")),
+                "trend_classification": str(latest_row["Trend Classification"]),
+                "trend_score": int(latest_row["Trend Score"]),
+                "ma20_slope": numeric_or_none(latest_row.get("MA20 Slope (%)"), 2),
+                "ml_bullish_prob_pct": numeric_or_none(latest_row.get("ML Bull Prob (%)"), 2),
+                "ml_prediction": str(latest_row["ML Prediction"]),
+                "ml_confidence": str(latest_row["ML Confidence"]),
                 "ml_metrics": rf_metrics,
                 "feature_importances": feature_importance_df.to_dict(orient="records") if not feature_importance_df.empty else [],
                 "indicator_summary": response_payload["stage_3_indicators"],
@@ -487,16 +562,16 @@ def analyze_stock(
 
             f_score = fund_data.get("Fundamental Score")
             AnalysisRepository.save_trading_signal(db, stock.id, {
-                "signal": str(latest_row.get("Signal", "HOLD / WAIT")),
-                "confidence_score": int(latest_row.get("Signal Confidence (%)", 40)),
-                "technical_score": int(latest_row.get("Technical Score", 65)),
+                "signal": str(latest_row["Signal"]),
+                "confidence_score": int(latest_row["Signal Confidence (%)"]),
+                "technical_score": int(latest_row["Technical Score"]),
                 "fundamental_score": int(f_score) if isinstance(f_score, (int, float)) else None,
-                "risk_score": int(risk_data.get("Risk Score", 35)),
-                "risk_level": str(risk_data.get("Risk Category", "Moderate Risk")),
+                "risk_score": int(risk_data["Risk Score"]),
+                "risk_level": str(risk_data["Risk Category"]),
                 "entry_price": close_price,
                 "stop_loss": stop_loss,
                 "target_price": target_price,
-                "risk_reward_ratio": str(risk_data.get("Risk-to-Reward Ratio", "1:1.67")),
+                "risk_reward_ratio": str(risk_data["Risk-to-Reward Ratio"]),
                 "expected_time_horizon": "1 - 3 Months Swing / Position",
                 "pros": response_payload["stage_10_decision_engine"]["pros"],
                 "cons": response_payload["stage_10_decision_engine"]["cons"],
@@ -508,21 +583,24 @@ def analyze_stock(
             AnalysisRepository.save_risk_assessment(db, stock.id, risk_data, analysis_id=snapshot.id)
             FundamentalsRepository.upsert(db, stock.id, fund_data)
         except Exception as db_err:
-            print(f"      ⚠️ Failed to persist analysis results to DB: {db_err}")
+            logger.warning("Analysis persistence skipped request_id=%s error_type=%s", request.state.request_id, type(db_err).__name__)
 
         sanitized_payload = sanitize_json(response_payload)
         ANALYSIS_CACHE[cache_key] = (now, sanitized_payload)
         return JSONResponse(content=sanitized_payload)
 
 
-    except Exception as e:
+    except HTTPException:
+        raise
+    except ValueError as e:
         err_msg = str(e)
-        if "No data returned" in err_msg or "delisted" in err_msg:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Stock symbol '{ticker_clean}' was not found on Yahoo Finance. Please select a valid ticker (e.g. TATAMOTORS.NS, IOB.NS, RELIANCE.NS)."
-            )
-        raise HTTPException(status_code=400, detail=f"Analysis failed for {ticker_clean}: {err_msg}")
+        logger.warning("Analysis rejected request_id=%s symbol=%s period=%s reason=%s", request.state.request_id, ticker_clean, period, err_msg)
+        if "Yahoo Finance returned no live OHLCV data" in err_msg:
+            raise HTTPException(status_code=502, detail=err_msg)
+        raise HTTPException(status_code=422, detail=f"Analysis failed for {ticker_clean}: {err_msg}")
+    except Exception as e:
+        logger.error("Analysis failed request_id=%s symbol=%s period=%s error_type=%s", request.state.request_id, ticker_clean, period, type(e).__name__)
+        raise HTTPException(status_code=500, detail=f"Analysis service failed. Reference ID: {request.state.request_id}") from e
 
 
 @app.get("/api/export/pdf")
@@ -566,7 +644,8 @@ def export_pdf(
         )
 
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"PDF Export failed for {ticker_clean}: {str(e)}")
+        logger.error("PDF export failed symbol=%s error_type=%s", ticker_clean, type(e).__name__)
+        raise HTTPException(status_code=500, detail=f"PDF export failed for {ticker_clean}. Please retry later.") from e
 
 
 @app.get("/api/export/excel")
@@ -604,7 +683,8 @@ def export_excel(
         )
 
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Excel Export failed for {ticker_clean}: {str(e)}")
+        logger.error("Excel export failed symbol=%s error_type=%s", ticker_clean, type(e).__name__)
+        raise HTTPException(status_code=500, detail=f"Excel export failed for {ticker_clean}. Please retry later.") from e
 
 
 @app.get("/api/signals/latest")
@@ -683,23 +763,30 @@ def chatbot_query(
     if any(k in prompt_lower for k in ["an2", "share capital", "shares", "how many shares", "shareholding", "demerger"]):
         try:
             fund_data = analyze_fundamentals(ticker_clean, db=db)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Chat fundamentals unavailable symbol=%s error_type=%s", ticker_clean, type(exc).__name__)
             fund_data = {}
 
+        outstanding_shares = fund_data.get("Outstanding Shares")
+        promoter_holding = fund_data.get("Promoter Holding (%)")
+        institutional_holding = fund_data.get("Institutional Holding (%)")
+        fundamental_score = fund_data.get("Fundamental Score")
+        fundamental_score_text = (
+            f"{fundamental_score}/100 ({fund_data.get('Fundamental Rating')})"
+            if fundamental_score is not None else "Unavailable because required source fields are incomplete"
+        )
         response_payload = {
             "query": prompt,
             "symbol": ticker_clean,
             "agent_type": "ShareCapital_AN2_Agent",
             "reply": (
-                f"📊 **Tata Motors (AN2 Share Capital & Equity Breakdown)**:\n\n"
+                f"📊 **Share capital and ownership data for {ticker_clean}**:\n\n"
                 f"• **Ticker Symbol**: `{ticker_clean}`\n"
-                f"• **Total Outstanding Shares**: ~3,32,30,00,000 shares (~332.3 Crore equity shares)\n"
-                f"• **AN2 Note (Share Capital)**: Authorized Equity Capital of ₹1,00,00,00,000 (divided into 500 Crore Ordinary Shares of ₹2 each).\n"
-                f"• **Promoter Holding (Tata Sons)**: {fund_data.get('Promoter Holding (%)', 46.4)}%\n"
-                f"• **Institutional Holding (FII + DII)**: {fund_data.get('Institutional Holding (%)', 38.2)}%\n"
-                f"• **DVR Share Cancellation & Conversion**: Tata Motors DVR shares were converted to Ordinary Shares at a swap ratio of **7 Ordinary Shares for every 10 DVR Shares**.\n"
-                f"• **Demerger Structure**: Split into 2 separately listed entities: **Tata Motors Commercial Vehicles (TMCV)** and **Tata Motors Passenger Vehicles (TMPV)** (1:1 entitlement ratio).\n"
-                f"• **Fundamental Health Score**: {fund_data.get('Fundamental Score', 82)}/100 ({fund_data.get('Fundamental Rating', 'Strong Fundamentals')})"
+                f"• **Outstanding Shares**: {outstanding_shares if outstanding_shares is not None else 'Unavailable from the current data provider'}\n"
+                f"• **Promoter Holding**: {f'{promoter_holding}%' if promoter_holding is not None else 'Unavailable from the current data provider'}\n"
+                f"• **Institutional Ownership**: {f'{institutional_holding}%' if institutional_holding is not None else 'Unavailable from the current data provider'}\n"
+                f"• **Fundamental Score**: {fundamental_score_text}\n\n"
+                "Current provider data does not include exchange filings or official share-capital notes."
             ),
             "data": fund_data
         }
@@ -709,15 +796,11 @@ def chatbot_query(
         response_payload = {
             "query": prompt,
             "symbol": ticker_clean,
-            "agent_type": "Orchestrator_Agent",
+            "agent_type": "Platform_Info_Agent",
             "reply": (
-                "🤖 **Yes! A chatbot can absolutely use another chatbot.**\n\n"
-                "In QuantNova AI, we use a **Multi-Agent Chatbot Architecture**:\n"
-                "1. **Orchestrator Chatbot (Router)**: Parses your question and assigns tasks.\n"
-                "2. **Data & AN2 Retrieval Agent**: Queries market feeds, Yahoo Finance, and financial note disclosures.\n"
-                "3. **Quantitative Signal Agent**: Runs 25+ technical indicators (RSI, MACD, SuperTrend).\n"
-                "4. **Synthesis Agent**: Receives responses from Subagent Chatbots and composes the final institutional report.\n\n"
-                "This subagent approach ensures zero-hallucination accuracy and modular scalability!"
+                "QuantNova AI currently runs a deterministic quantitative pipeline and a rule-based research planner. "
+                "It does not run a multi-agent LLM system or query live news and exchange filings. "
+                "Market analysis uses provider data where available; missing source data is reported as unavailable."
             )
         }
 
@@ -725,8 +808,11 @@ def chatbot_query(
     else:
         try:
             fund_data = analyze_fundamentals(ticker_clean, db=db)
-        except Exception:
-            fund_data = {}
+        except Exception as exc:
+            logger.warning("Chat fundamentals unavailable symbol=%s error_type=%s", ticker_clean, type(exc).__name__)
+            fund_data = {"Fundamental Summary": "Fundamental metrics are unavailable because the data provider request failed."}
+
+        fundamental_score = fund_data.get("Fundamental Score")
 
         response_payload = {
             "query": prompt,
@@ -735,10 +821,10 @@ def chatbot_query(
             "reply": (
                 f"📈 **QuantNova AI Analysis for {ticker_clean}**:\n\n"
                 f"• **Company**: {fund_data.get('Company Name', ticker_symbol_name(ticker_clean))}\n"
-                f"• **Fundamental Score**: {fund_data.get('Fundamental Score', 'N/A')}/100\n"
+                f"• **Fundamental Score**: {f'{fundamental_score}/100' if fundamental_score is not None else 'Unavailable'}\n"
                 f"• **P/E Ratio**: {fund_data.get('PE Ratio', 'N/A')} | **ROE**: {fund_data.get('ROE (%)', 'N/A')}%\n"
                 f"• **Debt-to-Equity**: {fund_data.get('Debt to Equity', 'N/A')}\n\n"
-                f"**Summary**: {fund_data.get('Fundamental Summary', 'Analyzing market momentum and technical signals.')}"
+                f"**Summary**: {fund_data.get('Fundamental Summary', 'Fundamental metrics are unavailable.')}"
             ),
             "data": fund_data
         }
@@ -763,7 +849,7 @@ def chatbot_query(
             stock_id=stock_id,
         )
     except Exception as e:
-        print(f"      ⚠️ Failed to log AI chat interaction: {e}")
+        logger.warning("AI chat interaction logging failed symbol=%s error_type=%s", ticker_clean, type(e).__name__)
 
     return response_payload
 

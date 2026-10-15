@@ -34,19 +34,17 @@ def generate_buy_hold_sell_signals(df: pd.DataFrame) -> pd.DataFrame:
 
     for idx, row in df.iterrows():
         close = row["Close"]
-        atr = row.get("ATR (14)", close * 0.02)  # Fallback to 2% if ATR not available
-        if pd.isna(atr) or atr <= 0:
-            atr = close * 0.02
+        atr = row.get("ATR (14)", np.nan)
 
         # Check for initial warmup rows
         req = [row.get("SMA 20", row.get("20-Day MA")), row.get("RSI (14)"), row.get("MACD")]
-        if any(pd.isna(v) for v in req):
+        if any(pd.isna(v) for v in req) or pd.isna(atr) or atr <= 0:
             signals.append("HOLD / WAIT")
             confidence_scores.append(0)
             risk_levels.append("High Risk")
             reasons_list.append("Indicator windows initializing.")
-            stop_losses.append(round(close - (1.5 * atr), 2))
-            target_prices.append(round(close + (1.5 * atr), 2))
+            stop_losses.append(round(close - (1.5 * atr), 2) if pd.notna(atr) and atr > 0 else np.nan)
+            target_prices.append(round(close + (1.5 * atr), 2) if pd.notna(atr) and atr > 0 else np.nan)
             action_plans.append("Wait for indicator windows to fill.")
             continue
 
@@ -73,12 +71,9 @@ def generate_buy_hold_sell_signals(df: pd.DataFrame) -> pd.DataFrame:
 
         # --- Component 2: Technical Indicators (Weight: 35%) ---
         rsi = row["RSI (14)"]
-        macd_hist = row.get("MACD Histogram", 0.0)
-        stoch_k = row.get("Stoch %K", 50.0)
-        adx = row.get("ADX (14)", 15.0)
-        pos_di = row.get("+DI", 0.0)
-        neg_di = row.get("-DI", 0.0)
-        vwap = row.get("VWAP", close)
+        macd_hist = row.get("MACD Histogram", np.nan)
+        stoch_k = row.get("Stoch %K", np.nan)
+        vwap = row.get("VWAP", np.nan)
 
         if rsi >= 55:
             score += 1.25
@@ -87,17 +82,17 @@ def generate_buy_hold_sell_signals(df: pd.DataFrame) -> pd.DataFrame:
             score -= 1.25
             reasons.append(f"RSI bearish ({rsi:.1f})")
 
-        if macd_hist > 0:
+        if pd.notna(macd_hist) and macd_hist > 0:
             score += 1.25
             reasons.append("MACD histogram positive")
-        elif macd_hist < 0:
+        elif pd.notna(macd_hist) and macd_hist < 0:
             score -= 1.25
             reasons.append("MACD histogram negative")
 
-        if close > vwap:
+        if pd.notna(vwap) and close > vwap:
             score += 0.5
             reasons.append("Price above VWAP")
-        elif close < vwap:
+        elif pd.notna(vwap) and close < vwap:
             score -= 0.5
             reasons.append("Price below VWAP")
 
@@ -110,11 +105,11 @@ def generate_buy_hold_sell_signals(df: pd.DataFrame) -> pd.DataFrame:
                 reasons.append(f"Stochastic overbought ({stoch_k:.1f})")
 
         # --- Component 3: Machine Learning Model (Weight: 30%) ---
-        ml_prob = row.get("ML Bull Prob (%)", 50.0)
-        if ml_prob >= 60.0:
+        ml_prob = row.get("ML Bull Prob (%)", np.nan)
+        if pd.notna(ml_prob) and ml_prob >= 60.0:
             score += 3.0
             reasons.append(f"ML Model: Bullish forecast ({ml_prob:.1f}% prob)")
-        elif ml_prob <= 40.0:
+        elif pd.notna(ml_prob) and ml_prob <= 40.0:
             score -= 3.0
             reasons.append(f"ML Model: Bearish forecast ({ml_prob:.1f}% prob)")
 
@@ -175,13 +170,22 @@ def generate_buy_hold_sell_signals(df: pd.DataFrame) -> pd.DataFrame:
     res["Signal Action Plan"] = action_plans
 
     # Technical Score (0-100)
-    res["Technical Score"] = res.apply(
-        lambda r: int(min(max(50 + (
-            (15 if "Bullish" in str(r.get("Trend Classification", "")) else -15 if "Bearish" in str(r.get("Trend Classification", "")) else 0) +
-            (10 if r.get("RSI (14)", 50) > 55 else -10 if r.get("RSI (14)", 50) < 45 else 0) +
-            (10 if r.get("MACD Histogram", 0) > 0 else -10) +
-            (10 if r.get("Close", 0) > r.get("SMA 50", 0) else -10)
-        ), 10), 98)), axis=1
-    )
+    def calculate_technical_score(row):
+        score = 50
+        trend = row.get("Trend Classification")
+        if pd.notna(trend):
+            score += 15 if "Bullish" in str(trend) else -15 if "Bearish" in str(trend) else 0
+        rsi = row.get("RSI (14)")
+        if pd.notna(rsi):
+            score += 10 if rsi > 55 else -10 if rsi < 45 else 0
+        macd_histogram = row.get("MACD Histogram")
+        if pd.notna(macd_histogram):
+            score += 10 if macd_histogram > 0 else -10 if macd_histogram < 0 else 0
+        sma50 = row.get("SMA 50")
+        if pd.notna(sma50):
+            score += 10 if row["Close"] > sma50 else -10
+        return int(min(max(score, 10), 98))
+
+    res["Technical Score"] = res.apply(calculate_technical_score, axis=1)
 
     return res

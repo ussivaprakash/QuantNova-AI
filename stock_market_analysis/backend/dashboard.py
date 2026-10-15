@@ -19,12 +19,30 @@ from plotly.subplots import make_subplots
 from data_loader import PipelineConfig
 
 
+def _format_metric(value, precision=2, prefix="", suffix=""):
+    if value is None or pd.isna(value):
+        return "Unavailable"
+    try:
+        return f"{prefix}{float(value):.{precision}f}{suffix}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _return_percent(equity, initial_capital=100000.0):
+    if equity is None or pd.isna(equity):
+        return None
+    return (float(equity) - initial_capital) / initial_capital * 100
+
+
 def generate_html_dashboard(df: pd.DataFrame, config: PipelineConfig) -> Path:
     """
     Builds a full-featured, dark-mode responsive Plotly trading dashboard.
     """
     config.output_dashboard.parent.mkdir(parents=True, exist_ok=True)
     latest = df.iloc[-1]
+    strategy_return = _return_percent(latest.get("Strategy Equity"))
+    benchmark_return = _return_percent(latest.get("Benchmark Equity"))
+    alpha_return = strategy_return - benchmark_return if strategy_return is not None and benchmark_return is not None else None
 
     # Current recommendation styling
     signal = str(latest.get("Signal", latest.get("Signal Category", "HOLD / WAIT")))
@@ -209,8 +227,8 @@ def generate_html_dashboard(df: pd.DataFrame, config: PipelineConfig) -> Path:
                     Confidence: <span class="font-bold text-white">{latest.get('Signal Confidence (%)', 0)}%</span> | Risk: <span class="font-bold text-amber-400">{latest.get('Risk Level', 'N/A')}</span>
                 </div>
                 <div class="mt-3 grid grid-cols-2 gap-2 text-xs border-t border-slate-800 pt-3">
-                    <div>Stop Loss: <span class="font-bold text-rose-400">₹{latest.get('Suggested Stop Loss (₹)', 0):.2f}</span></div>
-                    <div>Target: <span class="font-bold text-emerald-400">₹{latest.get('Suggested Target Price (₹)', 0):.2f}</span></div>
+                    <div>Stop Loss: <span class="font-bold text-rose-400">{_format_metric(latest.get('Suggested Stop Loss (₹)'), 2, '₹')}</span></div>
+                    <div>Target: <span class="font-bold text-emerald-400">{_format_metric(latest.get('Suggested Target Price (₹)'), 2, '₹')}</span></div>
                 </div>
             </div>
 
@@ -222,14 +240,14 @@ def generate_html_dashboard(df: pd.DataFrame, config: PipelineConfig) -> Path:
                     Classification: <span class="font-bold text-cyan-400">{latest.get('Trend Classification', 'N/A')}</span>
                 </div>
                 <div class="mt-1 text-xs text-slate-400">
-                    SMA 20: <span class="text-slate-200">₹{latest.get('SMA 20', latest.get('20-Day MA', 0)):.2f}</span>
+                    SMA 20: <span class="text-slate-200">{_format_metric(latest.get('SMA 20', latest.get('20-Day MA')), 2, '₹')}</span>
                 </div>
             </div>
 
             <!-- Machine Learning Model Card -->
             <div class="p-6 rounded-2xl bg-slate-900 border border-slate-800 shadow-xl">
                 <div class="text-xs uppercase tracking-wider font-semibold text-slate-400">Random Forest Forecast</div>
-                <div class="mt-3 text-3xl font-extrabold text-cyan-400">{latest.get('ML Bull Prob (%)', 50):.1f}%</div>
+                <div class="mt-3 text-3xl font-extrabold text-cyan-400">{_format_metric(latest.get('ML Bull Prob (%)'), 1, suffix='%')}</div>
                 <div class="mt-2 text-xs text-slate-300">
                     Bullish Probability | Forecast: <span class="font-bold text-slate-200">{latest.get('ML Prediction', 'N/A')}</span>
                 </div>
@@ -242,13 +260,13 @@ def generate_html_dashboard(df: pd.DataFrame, config: PipelineConfig) -> Path:
             <div class="p-6 rounded-2xl bg-slate-900 border border-slate-800 shadow-xl">
                 <div class="text-xs uppercase tracking-wider font-semibold text-slate-400">Strategy vs Benchmark</div>
                 <div class="mt-3 text-2xl font-extrabold text-emerald-400">
-                    {((latest.get('Strategy Equity', 100000) - 100000) / 100000 * 100):.2f}% Return
+                    {_format_metric(strategy_return, 2, suffix='%')} Return
                 </div>
                 <div class="mt-2 text-xs text-slate-300">
-                    Buy & Hold: <span class="font-bold text-rose-400">{((latest.get('Benchmark Equity', 100000) - 100000) / 100000 * 100):.2f}%</span>
+                    Buy & Hold: <span class="font-bold text-rose-400">{_format_metric(benchmark_return, 2, suffix='%')}</span>
                 </div>
                 <div class="mt-1 text-xs text-slate-400">
-                    Alpha Generated: <span class="font-bold text-emerald-400">+{( ((latest.get('Strategy Equity', 100000) - 100000) / 100000 * 100) - ((latest.get('Benchmark Equity', 100000) - 100000) / 100000 * 100) ):.2f}%</span>
+                    Alpha Generated: <span class="font-bold text-emerald-400">{_format_metric(alpha_return, 2, suffix='%')}</span>
                 </div>
             </div>
         </div>

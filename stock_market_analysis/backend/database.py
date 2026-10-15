@@ -39,6 +39,7 @@ if SQLALCHEMY_AVAILABLE:
             "max_overflow": settings.db_max_overflow,
             "pool_timeout": settings.db_pool_timeout,
             "pool_recycle": settings.db_pool_recycle,
+            "connect_args": {"connect_timeout": 5},
         })
 
     try:
@@ -61,12 +62,12 @@ if SQLALCHEMY_AVAILABLE:
                     bind=engine,
                     expire_on_commit=False,
                 )
-            except Exception:
-                logger.warning("Failed to initialize SQLAlchemy engine: %s", exc)
+            except Exception as fallback_exc:
+                logger.warning("Failed to initialize SQLAlchemy engine (primary=%s fallback=%s)", type(exc).__name__, type(fallback_exc).__name__)
                 engine = None
                 SessionLocal = None
         else:
-            logger.warning("Failed to initialize SQLAlchemy engine: %s", exc)
+            logger.warning("Failed to initialize SQLAlchemy engine (error_type=%s)", type(exc).__name__)
             engine = None
             SessionLocal = None
 
@@ -99,5 +100,5 @@ def check_database_connection() -> bool:
             conn.execute(text("SELECT 1"))
         return True
     except Exception as exc:
-        logger.warning("Database connection check failed: %s", exc)
+        logger.warning("Database connection check failed (error_type=%s)", type(exc).__name__)
         return False

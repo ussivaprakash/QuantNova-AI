@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import Plot from 'react-plotly.js';
 import {
   Search,
@@ -27,24 +27,26 @@ interface AnalysisData {
   sector: string;
   latest_price: number;
   date: string;
+  market_data_source: string;
   stage_1_collection: { records_count: number; date_min: string; date_max: string };
   stage_2_cleaning: {
     "Duplicates Removed": number;
     "Missing Values Imputed": number;
     "Price Range Violations Fixed": number;
+    "Rows Excluded for Missing Values": number;
   };
   stage_3_indicators: {
-    rsi: number;
-    macd_hist: number;
-    sma20: number;
-    sma50: number;
+    rsi: number | null;
+    macd_hist: number | null;
+    sma20: number | null;
+    sma50: number | null;
     atr: number;
-    adx: number;
-    vwap: number;
-    obv: number;
-    supertrend: number;
-    support1: number;
-    resistance1: number;
+    adx: number | null;
+    vwap: number | null;
+    obv: number | null;
+    supertrend: number | null;
+    support1: number | null;
+    resistance1: number | null;
   };
   stage_4_trend: {
     classification: string;
@@ -53,30 +55,30 @@ interface AnalysisData {
     ma20_slope: number;
   };
   stage_5_fundamentals: {
-    "Fundamental Score": number;
+    "Fundamental Score": number | null;
     "Fundamental Rating": string;
     "Fundamental Summary": string;
-    "Revenue Growth (%)": number;
-    "Profit Growth (%)": number;
-    "PE Ratio": number;
-    "PB Ratio": number;
-    "ROE (%)": number;
-    "ROCE (%)": number;
-    "Debt to Equity": number;
-    "Promoter Holding (%)": number;
-    "Institutional Holding (%)": number;
+    "Revenue Growth (%)": number | null;
+    "Profit Growth (%)": number | null;
+    "PE Ratio": number | null;
+    "PB Ratio": number | null;
+    "ROE (%)": number | null;
+    "ROCE (%)": number | null;
+    "Debt to Equity": number | null;
+    "Promoter Holding (%)": number | null;
+    "Institutional Holding (%)": number | null;
     "Key Highlights": string[];
   };
   stage_6_market_context: {
     "Benchmark Symbol": string;
-    "Nifty 1M Return (%)": number;
+    "Nifty 1M Return (%)": number | null;
     "Nifty Market Trend": string;
-    "Relative Strength Rating": number;
+    "Relative Strength Rating": number | null;
     "Market Volatility State": string;
     "Market Context Explanation": string;
   };
   stage_7_machine_learning: {
-    bullish_probability: number;
+    bullish_probability: number | null;
     prediction: string;
     confidence: string;
     metrics: { Accuracy?: number; Precision?: number; Recall?: number; "F1 Score"?: number };
@@ -103,7 +105,7 @@ interface AnalysisData {
     signal: string;
     confidence_score: number;
     technical_score: number;
-    fundamental_score: number;
+    fundamental_score: number | null;
     risk_score: number;
     risk_level: string;
     entry_price: number;
@@ -140,7 +142,32 @@ interface AnalysisData {
   };
 }
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:8000' : ''))
+  .replace(/\/+$/, '')
+  .replace(/\/api$/i, '');
+const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS) || 180_000;
+const displayOptional = (value: number | string | null | undefined) => value == null ? 'Unavailable' : value;
+
+async function apiFetch(path: string, signal?: AbortSignal) {
+  if (!API_BASE_URL) throw new Error('The analysis API is not configured. Set VITE_API_BASE_URL to the Render backend URL and redeploy.');
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, { signal });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    throw new Error('Could not connect to the analysis service. Check your connection and try again.');
+  }
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = typeof body?.detail === 'string' ? body.detail : `The analysis service returned HTTP ${response.status}.`;
+    throw new Error(detail);
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('The analysis service returned an invalid response.');
+  if (path.startsWith('/api/analyze') && (!body.stage_10_decision_engine || !body.chart_series || typeof body.latest_price !== 'number')) {
+    throw new Error('The analysis service returned an incomplete stock analysis. Please retry or contact support.');
+  }
+  return body;
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'intro' | 'dashboard'>('intro');
@@ -154,10 +181,11 @@ export default function App() {
 
   const [selectedPeriod, setSelectedPeriod] = useState<string>("1y");
   const [data, setData] = useState<AnalysisData | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<Array<{ symbol: string; name: string }>>([]);
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
+  const analysisController = useRef<AbortController | null>(null);
 
   // Custom Pending Limit Order & Trade Planning Simulator State
   const [customPriceInput, setCustomPriceInput] = useState<string>("");
@@ -165,65 +193,40 @@ export default function App() {
   const [customStopLossInput, setCustomStopLossInput] = useState<string>("");
 
   const fetchAnalysis = async (symbolToFetch: string, periodToFetch: string = selectedPeriod) => {
+    if (analysisController.current) return;
+    const controller = new AbortController();
+    analysisController.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
     setLoading(true);
     setError(null);
     setShowDropdown(false);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/analyze?symbol=${encodeURIComponent(symbolToFetch)}&period=${encodeURIComponent(periodToFetch)}`);
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || `Failed to load analysis for ${symbolToFetch}`);
-      }
+      const result = await apiFetch(`/api/analyze?symbol=${encodeURIComponent(symbolToFetch)}&period=${encodeURIComponent(periodToFetch)}`, controller.signal) as AnalysisData;
       setData(result);
-      setTicker(symbolToFetch);
+      setTicker(result.symbol);
       setSelectedPeriod(periodToFetch);
       setCustomPriceInput(result.stage_10_decision_engine.entry_price.toString());
       setCustomTargetInput(result.stage_10_decision_engine.target_price.toString());
       setCustomStopLossInput(result.stage_10_decision_engine.stop_loss.toString());
     } catch (err: any) {
-      console.warn("Primary fetch failed, loading default fallback:", err.message);
-      if (symbolToFetch !== "TMPV.NS") {
-        try {
-          const fallbackResp = await fetch(`${API_BASE_URL}/api/analyze?symbol=TMPV.NS&period=${encodeURIComponent(periodToFetch)}`);
-          if (fallbackResp.ok) {
-            const fallbackResult = await fallbackResp.json();
-            setData(fallbackResult);
-            setTicker("TMPV.NS");
-            setSelectedPeriod(periodToFetch);
-            setCustomPriceInput(fallbackResult.stage_10_decision_engine.entry_price.toString());
-            setCustomTargetInput(fallbackResult.stage_10_decision_engine.target_price.toString());
-            setCustomStopLossInput(fallbackResult.stage_10_decision_engine.stop_loss.toString());
-            setError(null);
-            return;
-
-          }
-        } catch (e) {
-          // ignore
-        }
-      }
-      setError(err.message || "Error analyzing stock");
+      setError(err instanceof DOMException && err.name === 'AbortError'
+        ? `Analysis exceeded ${Math.round(API_TIMEOUT_MS / 1000)} seconds. Please retry; the service may still be processing the request.`
+        : err instanceof Error ? err.message : 'Analysis failed. Please try again.');
     } finally {
+      window.clearTimeout(timeout);
+      analysisController.current = null;
       setLoading(false);
     }
   };
-
-
-  useEffect(() => {
-    fetchAnalysis("TMPV.NS", "1y");
-  }, []);
-
 
   const handleSearchChange = async (val: string) => {
     setSearchInput(val);
     if (val.trim().length >= 2) {
       try {
-        const res = await fetch(`${API_BASE_URL}/api/search?q=${encodeURIComponent(val)}`);
-        if (res.ok) {
-          const items = await res.json();
-          setSearchResults(items);
-          setShowDropdown(true);
-        }
-      } catch (e) {
+        const items = await apiFetch(`/api/search?q=${encodeURIComponent(val)}`) as Array<{ symbol: string; name: string }>;
+        setSearchResults(items);
+        setShowDropdown(true);
+      } catch {
         // ignore
       }
     } else {
@@ -255,12 +258,12 @@ export default function App() {
 
   const handleDownloadPDFDirect = () => {
     const sym = data?.symbol || ticker;
-    window.open(`${API_BASE_URL}/api/export/pdf?symbol=${encodeURIComponent(sym)}&period=${encodeURIComponent(selectedPeriod)}&split_pages=${splitPages}&inline=false`, '_blank');
+    if (API_BASE_URL) window.open(`${API_BASE_URL}/api/export/pdf?symbol=${encodeURIComponent(sym)}&period=${encodeURIComponent(selectedPeriod)}&split_pages=${splitPages}&inline=false`, '_blank');
   };
 
   const handleDownloadExcelDirect = () => {
     const sym = data?.symbol || ticker;
-    window.open(`${API_BASE_URL}/api/export/excel?symbol=${encodeURIComponent(sym)}&period=${encodeURIComponent(selectedPeriod)}&split_sheets=${splitSheets}`, '_blank');
+    if (API_BASE_URL) window.open(`${API_BASE_URL}/api/export/excel?symbol=${encodeURIComponent(sym)}&period=${encodeURIComponent(selectedPeriod)}&split_sheets=${splitSheets}`, '_blank');
   };
 
   // Planned Trade Scenario Simulator Metrics
@@ -390,94 +393,23 @@ export default function App() {
 
         </div>
 
-        {/* Continuous Live Running Stock Market Ticker Strip (CNBC / Moneycontrol Marquee Feel) */}
-        <div className="border-t border-b border-slate-200 bg-slate-900 text-white py-2.5 overflow-hidden shadow-inner relative">
-          <div className="flex items-center space-x-6 animate-marquee whitespace-nowrap text-xs">
-            {/* Live Market Indicator */}
-            <div className="flex items-center space-x-2 px-3 py-1 bg-slate-800 rounded-lg border border-slate-700 font-bold shrink-0">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
-              <span className="text-emerald-400 text-[11px] uppercase tracking-wider">Live Market Feed:</span>
-            </div>
-
-            {/* Ticker Item 1: Nifty 50 */}
-            <div
-              onClick={() => { setSearchInput("^NSEI"); fetchAnalysis("^NSEI"); setActiveTab('dashboard'); }}
-              className="inline-flex items-center space-x-2 bg-slate-800/80 px-3.5 py-1.5 rounded-xl border border-slate-700 cursor-pointer hover:border-indigo-400 transition-all text-xs shrink-0"
-            >
-              <span className="font-bold text-slate-200">🇮🇳 Nifty 50</span>
-              <span className="font-extrabold text-white">24,380.50</span>
-              <span className="text-[10px] font-bold text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800">+0.42% 📈</span>
-            </div>
-
-            {/* Ticker Item 2: BSE Sensex */}
-            <div
-              onClick={() => { setSearchInput("^BSESN"); fetchAnalysis("^BSESN"); setActiveTab('dashboard'); }}
-              className="inline-flex items-center space-x-2 bg-slate-800/80 px-3.5 py-1.5 rounded-xl border border-slate-700 cursor-pointer hover:border-blue-400 transition-all text-xs shrink-0"
-            >
-              <span className="font-bold text-blue-300">🏛️ BSE Sensex</span>
-              <span className="font-extrabold text-white">80,110.20</span>
-              <span className="text-[10px] font-bold text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800">+0.38% 🟢</span>
-            </div>
-
-            {/* Ticker Item 3: Bank Nifty */}
-            <div
-              onClick={() => { setSearchInput("^NSEBANK"); fetchAnalysis("^NSEBANK"); setActiveTab('dashboard'); }}
-              className="inline-flex items-center space-x-2 bg-slate-800/80 px-3.5 py-1.5 rounded-xl border border-slate-700 cursor-pointer hover:border-violet-400 transition-all text-xs shrink-0"
-            >
-              <span className="font-bold text-violet-300">🏦 Bank Nifty</span>
-              <span className="font-extrabold text-white">52,340.15</span>
-              <span className="text-[10px] font-bold text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800">+0.55% ⚡</span>
-            </div>
-
-            {/* Ticker Item 4: Gold */}
-            <div
-              onClick={() => { setSearchInput("GC=F"); fetchAnalysis("GC=F"); setActiveTab('dashboard'); }}
-              className="inline-flex items-center space-x-2 bg-slate-800/80 px-3.5 py-1.5 rounded-xl border border-slate-700 cursor-pointer hover:border-amber-400 transition-all text-xs shrink-0"
-            >
-              <span className="font-bold text-amber-300">🪙 Gold</span>
-              <span className="font-extrabold text-amber-200">₹72,450</span>
-              <span className="text-[10px] font-bold text-amber-400 bg-amber-950/60 px-1.5 py-0.5 rounded border border-amber-800">+0.65% 🚀</span>
-            </div>
-
-            {/* Ticker Item 5: Crude Oil */}
-            <div
-              onClick={() => { setSearchInput("CL=F"); fetchAnalysis("CL=F"); setActiveTab('dashboard'); }}
-              className="inline-flex items-center space-x-2 bg-slate-800/80 px-3.5 py-1.5 rounded-xl border border-slate-700 cursor-pointer hover:border-rose-400 transition-all text-xs shrink-0"
-            >
-              <span className="font-bold text-slate-300">🛢️ Crude Oil</span>
-              <span className="font-extrabold text-white">₹6,550</span>
-              <span className="text-[10px] font-bold text-rose-400 bg-rose-950/60 px-1.5 py-0.5 rounded border border-rose-800">-0.30% 🔻</span>
-            </div>
-
-            {/* Ticker Item 6: USD / INR */}
-            <div
-              onClick={() => { setSearchInput("INR=X"); fetchAnalysis("INR=X"); setActiveTab('dashboard'); }}
-              className="inline-flex items-center space-x-2 bg-slate-800/80 px-3.5 py-1.5 rounded-xl border border-slate-700 cursor-pointer hover:border-teal-400 transition-all text-xs shrink-0"
-            >
-              <span className="font-bold text-teal-300">💵 USD/INR</span>
-              <span className="font-extrabold text-teal-200">₹83.92</span>
-              <span className="text-[10px] font-bold text-teal-400 bg-teal-950/60 px-1.5 py-0.5 rounded border border-teal-800">+0.05% ⚖️</span>
-            </div>
-
-            {/* Ticker Item 7: Tata Motors */}
-            <div
-              onClick={() => { setSearchInput("TMPV.NS"); fetchAnalysis("TMPV.NS"); setActiveTab('dashboard'); }}
-              className="inline-flex items-center space-x-2 bg-slate-800/80 px-3.5 py-1.5 rounded-xl border border-slate-700 cursor-pointer hover:border-indigo-400 transition-all text-xs shrink-0"
-            >
-              <span className="font-bold text-indigo-300">🚗 Tata Motors</span>
-              <span className="font-extrabold text-white">₹348.10</span>
-              <span className="text-[10px] font-bold text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800">+1.20% 📈</span>
-            </div>
-
-            {/* Ticker Item 8: Reliance */}
-            <div
-              onClick={() => { setSearchInput("RELIANCE.NS"); fetchAnalysis("RELIANCE.NS"); setActiveTab('dashboard'); }}
-              className="inline-flex items-center space-x-2 bg-slate-800/80 px-3.5 py-1.5 rounded-xl border border-slate-700 cursor-pointer hover:border-blue-400 transition-all text-xs shrink-0"
-            >
-              <span className="font-bold text-blue-300">🏢 Reliance</span>
-              <span className="font-extrabold text-white">₹2,980.00</span>
-              <span className="text-[10px] font-bold text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800">+0.85% 🟢</span>
-            </div>
+        <div className="border-t border-b border-slate-200 bg-slate-900 text-white py-2.5 overflow-x-auto shadow-inner">
+          <div className="flex items-center gap-3 px-4 whitespace-nowrap text-xs">
+            <span className="text-slate-300 font-semibold">Quick analysis:</span>
+            {[
+              { label: 'Nifty 50', symbol: '^NSEI' },
+              { label: 'BSE Sensex', symbol: '^BSESN' },
+              { label: 'Bank Nifty', symbol: '^NSEBANK' },
+              { label: 'Gold', symbol: 'GC=F' },
+              { label: 'Crude Oil', symbol: 'CL=F' },
+              { label: 'USD/INR', symbol: 'INR=X' },
+              { label: 'Tata Motors', symbol: 'TMPV.NS' },
+              { label: 'Reliance', symbol: 'RELIANCE.NS' },
+            ].map(({ label, symbol }) => (
+              <button key={symbol} type="button" disabled={loading} onClick={() => { setSearchInput(symbol); fetchAnalysis(symbol); setActiveTab('dashboard'); }} className="bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700 hover:border-indigo-400 disabled:opacity-50">
+                {label} <span className="text-slate-400">{symbol}</span>
+              </button>
+            ))}
           </div>
         </div>
 
@@ -510,7 +442,7 @@ export default function App() {
                 <span>Institutional Stock Intelligence Platform</span>
               </div>
               <h1 className="text-3xl md:text-5xl font-black text-slate-900 tracking-tight leading-tight">
-                Empowering Traders with <span className="text-indigo-600">13-Stage Quantitative AI</span> Research
+                Empowering Traders with <span className="text-indigo-600">10-Stage Quantitative</span> Research
               </h1>
               <p className="text-slate-600 text-sm md:text-base leading-relaxed">
                 <strong>QuantNova AI</strong> is an institutional-grade quantitative research and stock intelligence engine. It combines multi-year market data ingestion, 25+ technical indicators, Random Forest machine learning models, fundamental financial audits, and interactive trade limit order simulation into one seamless platform formatted in Indian Rupees (<strong>₹</strong>).
@@ -573,9 +505,9 @@ export default function App() {
               {/* Step 3 */}
               <div className="p-5 rounded-2xl bg-slate-50 border border-slate-200 space-y-2">
                 <div className="w-8 h-8 rounded-xl bg-blue-600 text-white font-extrabold text-xs flex items-center justify-center">3</div>
-                <h3 className="text-sm font-bold text-slate-900">AI Signal & 13-Stage Audit</h3>
+                <h3 className="text-sm font-bold text-slate-900">Quantitative Signal & Data Audit</h3>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Inspect the AI Decision Engine recommendation (<strong className="text-emerald-600">BUY</strong>, <strong className="text-rose-600">SELL</strong>, <strong className="text-amber-600">HOLD</strong>), confidence score %, technical indicator ratings, and 13-stage audit metrics.
+                  Inspect the quantitative decision engine recommendation (<strong className="text-emerald-600">BUY</strong>, <strong className="text-rose-600">SELL</strong>, <strong className="text-amber-600">HOLD</strong>), confidence score, technical indicator ratings, and market-data audit metrics.
                 </p>
               </div>
 
@@ -610,7 +542,7 @@ export default function App() {
                 <h3 className="text-lg font-bold text-slate-900">The Quantitative Theory & Science</h3>
               </div>
               <p className="text-xs text-slate-600 leading-relaxed">
-                Traditional retail trading relies on lagging indicators or emotional sentiment. <strong>QuantNova AI</strong> applies a rigorous 13-stage quantitative pipeline that ingests daily market data, cleans duplicate records, imputes missing values, and calculates 25+ mathematical technical indicators.
+                <strong>QuantNova AI</strong> runs a ten-step quantitative analysis over provider-sourced daily market data, validates OHLCV records, and calculates technical indicators. Incomplete OHLCV rows are excluded rather than filled with invented prices or volume.
               </p>
               <ul className="space-y-2 text-xs text-slate-700">
                 <li className="flex items-start space-x-2">
@@ -662,10 +594,25 @@ export default function App() {
       {/* ========================================================================= */}
       {/* 📊 LIVE DASHBOARD: UNIFIED SINGLE-PAGE PRO TRADING TERMINAL */}
       {/* ========================================================================= */}
-      {activeTab === 'dashboard' && (!data || loading) && (
+      {activeTab === 'dashboard' && loading && (
         <main className="max-w-7xl mx-auto px-6 mt-16 flex flex-col items-center justify-center space-y-4 w-full py-20">
           <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-          <p className="text-slate-600 text-sm font-medium animate-pulse">Running 13-Stage AI Quantitative Research Pipeline...</p>
+          <p className="text-slate-600 text-sm font-medium animate-pulse">Running quantitative research for {ticker}…</p>
+        </main>
+      )}
+
+      {activeTab === 'dashboard' && !loading && !data && error && (
+        <main className="max-w-7xl mx-auto px-6 mt-16 flex flex-col items-center justify-center space-y-4 w-full py-20">
+          <AlertTriangle className="w-10 h-10 text-rose-500" />
+          <p className="text-slate-700 text-sm">Analysis could not be completed.</p>
+          <button onClick={() => fetchAnalysis(searchInput.trim() || ticker, selectedPeriod)} className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-sm px-4 py-2 rounded-xl">Retry analysis</button>
+        </main>
+      )}
+
+      {activeTab === 'dashboard' && !loading && !data && !error && (
+        <main className="max-w-7xl mx-auto px-6 mt-16 flex flex-col items-center justify-center space-y-4 w-full py-20">
+          <BarChart3 className="w-10 h-10 text-indigo-500" />
+          <p className="text-slate-700 text-sm">Search for a symbol and select Analyze to run the quantitative research pipeline.</p>
         </main>
       )}
 
@@ -717,15 +664,17 @@ export default function App() {
                     {data.company_name}
                   </span>
                   <span className="text-xs font-bold text-indigo-700 px-2.5 py-0.5 rounded-md bg-indigo-50 border border-indigo-200">
-                    NSE Listed
+                    {data.symbol.endsWith('.NS') ? 'NSE' : data.symbol.endsWith('.BO') ? 'BSE' : 'Yahoo Finance symbol'}
                   </span>
                 </div>
                 <div className="text-xs text-slate-500 flex flex-wrap items-center gap-3 pt-1">
                   <span>Sector: <strong className="text-slate-800">{data.sector}</strong></span>
                   <span>•</span>
-                  <span>Live Close: <strong className="text-slate-900 text-sm">₹{data.latest_price.toFixed(2)}</strong></span>
+                  <span>Latest close: <strong className="text-slate-900 text-sm">₹{data.latest_price.toFixed(2)}</strong></span>
                   <span>•</span>
                   <span>As of: <strong className="text-slate-800">{data.date}</strong></span>
+                  <span>•</span>
+                  <span>Source: <strong className="text-slate-800">{data.market_data_source === 'postgresql_cache' ? 'PostgreSQL cache' : 'Yahoo Finance'}</strong></span>
                 </div>
               </div>
 
@@ -861,7 +810,7 @@ export default function App() {
               </div>
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
                 <span className="text-slate-500 block mb-1">Fundamental Score</span>
-                <span className="text-xl font-extrabold text-blue-700">{data.stage_10_decision_engine.fundamental_score} / 100</span>
+          <span className="text-xl font-extrabold text-blue-700">{data.stage_10_decision_engine.fundamental_score ?? 'Unavailable'}{data.stage_10_decision_engine.fundamental_score !== null ? ' / 100' : ''}</span>
               </div>
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
                 <span className="text-slate-500 block mb-1">Risk Score</span>
@@ -878,7 +827,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* 13-Stage Grid Cards */}
+          {/* Quantitative analysis stages */}
           <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
             {/* Stage 1 & 2 Card */}
             <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm">
@@ -896,8 +845,8 @@ export default function App() {
                   <span className="font-semibold text-emerald-600">{data.stage_2_cleaning["Duplicates Removed"]}</span>
                 </div>
                 <div className="flex justify-between py-1">
-                  <span className="text-slate-500">Nulls Imputed</span>
-                  <span className="font-semibold text-emerald-600">{data.stage_2_cleaning["Missing Values Imputed"]}</span>
+                  <span className="text-slate-500">Incomplete Rows Excluded</span>
+                  <span className="font-semibold text-emerald-600">{data.stage_2_cleaning["Rows Excluded for Missing Values"]}</span>
                 </div>
               </div>
             </div>
@@ -911,15 +860,15 @@ export default function App() {
               <div className="space-y-2 text-xs">
                 <div className="flex justify-between py-1 border-b border-slate-100">
                   <span className="text-slate-500">RSI (14)</span>
-                  <span className="font-semibold text-pink-600">{data.stage_3_indicators.rsi}</span>
+                <span className="font-semibold text-pink-600">{data.stage_3_indicators.rsi ?? 'Unavailable'}</span>
                 </div>
                 <div className="flex justify-between py-1 border-b border-slate-100">
                   <span className="text-slate-500">SuperTrend</span>
-                  <span className="font-semibold text-emerald-600">₹{data.stage_3_indicators.supertrend}</span>
+                <span className="font-semibold text-emerald-600">{data.stage_3_indicators.supertrend == null ? 'Unavailable' : `₹${data.stage_3_indicators.supertrend}`}</span>
                 </div>
                 <div className="flex justify-between py-1">
                   <span className="text-slate-500">Pivot S1 / R1</span>
-                  <span className="font-semibold text-slate-800">₹{data.stage_3_indicators.support1} / ₹{data.stage_3_indicators.resistance1}</span>
+                <span className="font-semibold text-slate-800">{data.stage_3_indicators.support1 == null || data.stage_3_indicators.resistance1 == null ? 'Unavailable' : `₹${data.stage_3_indicators.support1} / ₹${data.stage_3_indicators.resistance1}`}</span>
                 </div>
               </div>
             </div>
@@ -940,7 +889,7 @@ export default function App() {
                 <Compass className="w-4 h-4 text-indigo-600" />
                 <span>Stage 6: Market Context</span>
               </div>
-              <div className="text-sm font-bold text-slate-900 mb-1">Nifty RS: {data.stage_6_market_context["Relative Strength Rating"]}/99</div>
+              <div className="text-sm font-bold text-slate-900 mb-1">Nifty RS: {data.stage_6_market_context["Relative Strength Rating"] ?? 'Unavailable'}{data.stage_6_market_context["Relative Strength Rating"] !== null ? '/99' : ''}</div>
               <p className="text-[11px] text-slate-500 leading-tight truncate" title={data.stage_6_market_context["Market Context Explanation"]}>{data.stage_6_market_context["Nifty Market Trend"]}</p>
             </div>
           </div>
@@ -997,7 +946,7 @@ export default function App() {
           <div className="p-6 rounded-3xl bg-white border border-slate-200 shadow-sm">
             <h2 className="text-lg font-bold text-slate-900 mb-4 flex items-center space-x-2">
               <BarChart3 className="w-5 h-5 text-indigo-600" />
-              <span>Stage 12: Synchronized Interactive Visual Dashboard</span>
+              <span>Interactive Price, Indicator & Backtest Dashboard</span>
             </h2>
             <div className="w-full overflow-hidden">
               <Plot
@@ -1089,7 +1038,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Stage 5: Fundamentals & Stage 8: Backtest Metrics Grid */}
+          {/* Stage 5: Fundamentals & Stage 10: Backtest Metrics Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Fundamental Financials Table */}
             <div className="p-6 rounded-3xl bg-white border border-slate-200 shadow-sm">
@@ -1100,27 +1049,27 @@ export default function App() {
               <div className="space-y-3 text-xs">
                 <div className="flex justify-between py-2 border-b border-slate-100">
                   <span className="text-slate-500">Revenue Growth (YoY)</span>
-                  <span className="font-semibold text-slate-900">{data.stage_5_fundamentals["Revenue Growth (%)"]}%</span>
+                  <span className="font-semibold text-slate-900">{displayOptional(data.stage_5_fundamentals["Revenue Growth (%)"])}{data.stage_5_fundamentals["Revenue Growth (%)"] == null ? '' : '%'}</span>
                 </div>
                 <div className="flex justify-between py-2 border-b border-slate-100">
                   <span className="text-slate-500">Profit Growth (YoY)</span>
-                  <span className="font-semibold text-slate-900">{data.stage_5_fundamentals["Profit Growth (%)"]}%</span>
+                  <span className="font-semibold text-slate-900">{displayOptional(data.stage_5_fundamentals["Profit Growth (%)"])}{data.stage_5_fundamentals["Profit Growth (%)"] == null ? '' : '%'}</span>
                 </div>
                 <div className="flex justify-between py-2 border-b border-slate-100">
                   <span className="text-slate-500">P/E Ratio</span>
-                  <span className="font-semibold text-slate-900">{data.stage_5_fundamentals["PE Ratio"]}</span>
+                  <span className="font-semibold text-slate-900">{displayOptional(data.stage_5_fundamentals["PE Ratio"])}</span>
                 </div>
                 <div className="flex justify-between py-2 border-b border-slate-100">
                   <span className="text-slate-500">P/B Ratio</span>
-                  <span className="font-semibold text-slate-900">{data.stage_5_fundamentals["PB Ratio"]}</span>
+                  <span className="font-semibold text-slate-900">{displayOptional(data.stage_5_fundamentals["PB Ratio"])}</span>
                 </div>
                 <div className="flex justify-between py-2 border-b border-slate-100">
                   <span className="text-slate-500">ROE %</span>
-                  <span className="font-semibold text-indigo-700">{data.stage_5_fundamentals["ROE (%)"]}%</span>
+                  <span className="font-semibold text-indigo-700">{displayOptional(data.stage_5_fundamentals["ROE (%)"])}{data.stage_5_fundamentals["ROE (%)"] == null ? '' : '%'}</span>
                 </div>
                 <div className="flex justify-between py-2">
                   <span className="text-slate-500">Promoter Holding</span>
-                  <span className="font-semibold text-indigo-700">{data.stage_5_fundamentals["Promoter Holding (%)"]}%</span>
+                  <span className="font-semibold text-indigo-700">{displayOptional(data.stage_5_fundamentals["Promoter Holding (%)"])}{data.stage_5_fundamentals["Promoter Holding (%)"] == null ? '' : '%'}</span>
                 </div>
               </div>
             </div>
@@ -1129,7 +1078,7 @@ export default function App() {
             <div className="p-6 rounded-3xl bg-white border border-slate-200 shadow-sm">
               <h3 className="text-base font-bold text-slate-900 mb-4 flex items-center space-x-2">
                 <BarChart3 className="w-5 h-5 text-indigo-600" />
-                <span>Stage 8: Strategy Backtest vs Buy-and-Hold Benchmark</span>
+                <span>Stage 10: Strategy Backtest vs Buy-and-Hold Benchmark</span>
               </h3>
               <div className="overflow-x-auto text-xs">
                 <table className="w-full text-left border-collapse">

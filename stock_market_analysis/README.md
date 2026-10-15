@@ -31,16 +31,16 @@ stock_market_analysis/
 │   ├── alembic.ini          # Alembic migration configuration
 │   ├── data_loader.py       # Stage 1: Market Data Ingestion & DB Cache
 │   ├── data_cleaner.py      # Stage 2: Data Audit & Sanitization
-│   ├── indicators.py        # Stage 3: 25+ Technical Indicators (RSI, MACD, SuperTrend)
-│   ├── trend_analysis.py    # Stage 4: 5-Tier Trend Classification Engine
-│   ├── fundamentals.py      # Stage 5: Financial Ratios & Fundamental Health Score
-│   ├── market_context.py    # Stage 6: Nifty 50 Relative Strength & Sector Context
-│   ├── predictor.py         # Stage 7: Random Forest Machine Learning Classifier
-│   ├── backtester.py        # Stage 8: Historical Backtesting Engine vs Benchmark
-│   ├── risk_analysis.py     # Stage 9: Volatility & Position Sizing Engine
-│   ├── signal_engine.py     # Stage 10: Explainable Signal Engine (Pros/Cons/Risks)
-│   ├── pdf_exporter.py      # Stage 11: Professional ReportLab PDF Report Generator
-│   ├── dashboard.py         # Stage 12: 11-Sheet Excel & Plotly Dashboard Engine
+│   ├── indicators.py        # Stage 3: Technical Indicators (RSI, MACD, SuperTrend)
+│   ├── trend_analysis.py    # Stage 4: Trend Classification
+│   ├── fundamentals.py      # Stage 5: Financial Ratios & Fundamental Health
+│   ├── market_context.py    # Stage 6: Benchmark Context
+│   ├── predictor.py         # Stage 7: Random Forest Classifier
+│   ├── signal_engine.py     # Stage 8: Trading Signal Engine
+│   ├── risk_analysis.py     # Stage 9: Volatility & Position Sizing
+│   ├── backtester.py        # Stage 10: Historical Strategy Backtest
+│   ├── pdf_exporter.py      # On-demand PDF report generation
+│   ├── dashboard.py         # On-demand Excel and Plotly report generation
 │   └── main.py              # CLI Master Pipeline Runner
 │
 ├── frontend/                 # Vite + React + TypeScript + Tailwind Web Application
@@ -111,22 +111,13 @@ chmod +x start_app.sh
    - Go to Render Dashboard → **New +** → **Web Service**.
    - Connect your GitHub repository.
    - Set Root Directory: `stock_market_analysis`.
-   - Runtime: `Python 3`.
+   - Runtime: `Python 3`; `.python-version` selects Python 3.11 to match CI.
    - Build Command:
      ```bash
      pip install -r requirements.txt
      ```
-   - Start Command:
-     ```bash
-     ./start_render.sh
-     ```
-     *(Or: `python3 -m uvicorn backend.api:app --host 0.0.0.0 --port $PORT`)*
-   - Add Environment Variable:
-     - Key: `DATABASE_URL`
-     - Value: Paste the **Internal Database URL** from your Render PostgreSQL instance.
-       *(Note: QuantNova automatically converts `postgres://` to `postgresql+psycopg://`)*.
-     - Key: `CORS_ORIGINS`
-     - Value: `https://your-frontend.vercel.app`
+   - Start Command: `./start_render.sh` (the script binds Uvicorn to Render's `$PORT`).
+   - Set `APP_ENV=production`, `DEBUG=false`, and `CORS_ORIGINS=https://quant-nova-ai-rprt.vercel.app` in the Render service environment. Add the Render PostgreSQL `DATABASE_URL` when a database is provisioned. The API can run without a database, but database-backed caching and persistence will be unavailable.
 
 ### Frontend on Vercel
 
@@ -134,8 +125,9 @@ chmod +x start_app.sh
 2. Set Root Directory to `stock_market_analysis/frontend`.
 3. Set Framework Preset to `Vite`.
 4. Add Environment Variable:
-   - `VITE_API_URL=https://your-backend.onrender.com`
-5. Click **Deploy**.
+   - `VITE_API_BASE_URL=https://<actual-render-service>.onrender.com` (copy the hostname from the Render service dashboard; do not append `/api`).
+   - Optionally set `VITE_API_TIMEOUT_MS=180000`.
+5. Redeploy after changing either Vite variable because Vite embeds them in the build.
 
 ---
 

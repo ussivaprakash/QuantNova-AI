@@ -12,6 +12,7 @@ Pipeline Stages:
 
 import sys
 from pathlib import Path
+import pandas as pd
 
 # Add current code directory to python path
 CODE_DIR = Path(__file__).resolve().parent
@@ -91,7 +92,9 @@ def run_pipeline():
     print(f" Ticker               : {config.ticker}")
     print(f" Close Price          : ₹{latest['Close']:.2f}")
     print(f" Trend Classification : {latest.get('Trend Classification', 'N/A')}")
-    print(f" ML Bull Probability  : {latest.get('ML Bull Prob (%)', 50):.1f}%")
+    ml_probability = latest.get("ML Bull Prob (%)")
+    ml_probability_text = f"{ml_probability:.1f}%" if pd.notna(ml_probability) else "Unavailable"
+    print(f" ML Bull Probability  : {ml_probability_text}")
     print(f" Trade Signal         : {latest.get('Signal', 'HOLD / WAIT')}")
     print(f" Confidence Score     : {latest.get('Signal Confidence (%)', 0)}%")
     print(f" Risk Level           : {latest.get('Risk Level', 'N/A')}")
